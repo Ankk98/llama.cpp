@@ -1533,7 +1533,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
-                llama_synchronize(ctx_l);
+                // verify accept already synced ctx_tgt; skip redundant fence on hot path
+                if (n_tokens > 8) {
+                    llama_synchronize(ctx_l);
+                }
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp_no_sync(ctx_l, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
@@ -1611,9 +1614,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // adaptive block length from rolling hit rate (coding vs agentic)
             if (!getenv("DSPARK_NO_ADAPTIVE_NMAX") && n_acc_drafts >= 8 && n_gen_tokens > 0) {
                 const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
-                if (hit < 0.58f) {
+                if (hit < 0.50f) {
                     n_draft = std::min(n_draft, 2);
-                } else if (hit > 0.72f) {
+                } else if (hit > 0.65f) {
                     n_draft = std::min(params.n_max, block_size);
                 }
             }
@@ -1669,9 +1672,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
             if (!getenv("DSPARK_NO_ADAPTIVE_NMAX") && n_acc_drafts >= 8 && n_gen_tokens > 0) {
                 const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
-                if (hit < 0.58f) {
+                if (hit < 0.50f) {
                     n_draft = std::min(n_draft, 2);
-                } else if (hit > 0.72f) {
+                } else if (hit > 0.65f) {
                     n_draft = std::min(params.n_max, block_size);
                 }
             }

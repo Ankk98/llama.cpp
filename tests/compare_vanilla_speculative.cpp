@@ -441,8 +441,21 @@ int main(int argc, char ** argv) {
                     (int) vanilla.output[first_mismatch], (int) spec_stats.output[first_mismatch]);
         }
         // tokens/s already accounts for token count, so this is a fair throughput ratio
-        const double tgp_v = vanilla.gen_ms    > 0 ? vanilla.n_generated    / vanilla.gen_ms    : 0.0;
-        const double tgp_s = spec_stats.gen_ms > 0 ? spec_stats.n_generated / spec_stats.gen_ms : 0.0;
+        const double pp_v  = vanilla.pp_ms > 0 ? 1000.0 * vanilla.n_prompt / vanilla.pp_ms : 0.0;
+        const double pp_s  = spec_stats.pp_ms > 0 ? 1000.0 * spec_stats.n_prompt / spec_stats.pp_ms : 0.0;
+        const double tgp_v = vanilla.gen_ms > 0 ? 1000.0 * vanilla.n_generated / vanilla.gen_ms : 0.0;
+        const double tgp_s = spec_stats.gen_ms > 0 ? 1000.0 * spec_stats.n_generated / spec_stats.gen_ms : 0.0;
+        fprintf(stderr, "--- throughput ---\n");
+        fprintf(stderr, "  pp  (prefill):  vanilla %6.2f tok/s  |  spec %6.2f tok/s", pp_v, pp_s);
+        if (pp_v > 0 && pp_s > 0) {
+            fprintf(stderr, "  (%.2fx)", pp_s / pp_v);
+        }
+        fputc('\n', stderr);
+        fprintf(stderr, "  tgp (generate): vanilla %6.2f tok/s  |  spec %6.2f tok/s", tgp_v, tgp_s);
+        if (tgp_v > 0 && tgp_s > 0) {
+            fprintf(stderr, "  (%.2fx)", tgp_s / tgp_v);
+        }
+        fputc('\n', stderr);
         if (tgp_v > 0 && tgp_s > 0) {
             fprintf(stderr, "tgp speedup: %.2fx\n", tgp_s / tgp_v);
         }
