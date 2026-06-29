@@ -93,9 +93,12 @@ static int run_confidence_smoke(
             common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { 0 }, true);
         }
         llama_decode(ctx_tgt, batch_tgt);
-        common_speculative_process(spec, batch_tgt);
 
         auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+
+        llama_batch proc = batch_tgt;
+        proc.n_tokens = (int32_t) ids.size();
+        common_speculative_process(spec, proc);
         common_speculative_accept(spec, 0, (uint16_t) (ids.size() - 1));
         n_past += (int) ids.size() - 1;
         for (auto t : ids) {

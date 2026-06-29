@@ -151,7 +151,6 @@ int main(int argc, char ** argv) {
             common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { 0 }, true);
         }
         llama_decode(ctx_tgt, batch_tgt);
-        common_speculative_process(spec, batch_tgt);
 
         std::vector<int> idxs(draft.size() + 1);
         for (size_t i = 0; i < idxs.size(); ++i) {
@@ -159,6 +158,10 @@ int main(int argc, char ** argv) {
         }
         auto ids = common_sampler_sample_and_accept_n_dspark(
                 smpl.get(), ctx_tgt, idxs, draft, draft_probs, params.sampling.temp);
+
+        llama_batch proc = batch_tgt;
+        proc.n_tokens = (int32_t) ids.size();
+        common_speculative_process(spec, proc);
 
         accept_sum += (int) ids.size() - 1;
         steps++;

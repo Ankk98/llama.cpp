@@ -18,7 +18,10 @@ struct run_stats {
     double pp_ms = 0;
     double gen_ms = 0;
     double draft_ms = 0;  // time inside common_speculative_draft (draft fwd + cpu sampling)
-    double verify_ms = 0; // time inside target decode + accept
+    double verify_ms = 0; // time inside target decode + accept + process
+    double tgt_decode_ms = 0;
+    double verify_accept_ms = 0;
+    double verify_process_ms = 0;
     int n_prompt = 0;
     int n_generated = 0;
     int n_drafted = 0;
@@ -157,12 +160,22 @@ static int run_speculative(
         }
         const double tv0 = now_ms();
         llama_decode(ctx_tgt, batch_tgt);
-        common_speculative_process(spec, batch_tgt);
+        out->tgt_decode_ms += now_ms() - tv0;
 
+        const double ta0 = now_ms();
         auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
-        out->verify_ms += now_ms() - tv0;
+        out->verify_accept_ms += now_ms() - ta0;
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
+
+        // inject only the committed verify-window increment (accepted + bonus), not the
+        // full draft block - rejected draft positions must not become draft context
+        const double tp0 = now_ms();
+        llama_batch proc = batch_tgt;
+        proc.n_tokens = (int32_t) ids.size();
+        common_speculative_process(spec, proc);
+        out->verify_process_ms += now_ms() - tp0;
+        out->verify_ms += now_ms() - tv0;
 
         if (getenv("DSPARK_DEBUG")) {
             fprintf(stderr, "\n[step %2d] anchor='%s'\n", out->n_propose_steps,
@@ -350,7 +363,13 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "--- per-pass timing ---\n");
             fprintf(stderr, "  target forward (vanilla, 1 tok)   : %.2f ms\n", v_fwd);
             fprintf(stderr, "  draft  step (fwd + cpu sampling)  : %.2f ms  (proposes %d)\n", d_step, (int) spec_stats.n_drafted / std::max(1, spec_stats.n_propose_steps));
-            fprintf(stderr, "  verify step (target fwd + accept) : %.2f ms\n", vf_step);
+            fprintf(stderr, "  verify step (total)               : %.2f ms\n", vf_step);
+            fprintf(stderr, "    target decode (batched verify)  : %.2f ms\n",
+                    spec_stats.tgt_decode_ms / spec_stats.n_propose_steps);
+            fprintf(stderr, "    accept (sampling)               : %.2f ms\n",
+                    spec_stats.verify_accept_ms / spec_stats.n_propose_steps);
+            fprintf(stderr, "    process (encode+inject)         : %.2f ms\n",
+                    spec_stats.verify_process_ms / spec_stats.n_propose_steps);
             fprintf(stderr, "  => %.2f ms/propose for %.2f tokens = %.2f ms/token (vanilla %.2f ms/token)\n",
                     d_step + vf_step, tok_step,
                     tok_step > 0 ? (d_step + vf_step) / tok_step : 0.0, v_fwd);

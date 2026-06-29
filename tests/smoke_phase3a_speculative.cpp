@@ -189,7 +189,6 @@ int main(int argc, char ** argv) {
             common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { seq_id }, true);
         }
         llama_decode(ctx_tgt, batch_tgt);
-        common_speculative_process(spec, batch_tgt);
 
         std::vector<llama_token> ids;
         if (!draft_probs.empty()) {
@@ -202,6 +201,10 @@ int main(int argc, char ** argv) {
         } else {
             ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
         }
+
+        llama_batch proc = batch_tgt;
+        proc.n_tokens = (int32_t) ids.size();
+        common_speculative_process(spec, proc);
 
         common_speculative_accept(spec, seq_id, (uint16_t) (ids.size() - 1));
 
