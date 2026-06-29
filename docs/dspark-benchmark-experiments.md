@@ -43,8 +43,9 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
 | `DSPARK_NO_ADAPTIVE_NMAX=1` | Fixed n_max (required for fair sweeps) |
 | `DSPARK_PROF=1` | Draft forward vs sampling split |
 | `DSPARK_SPLIT_VERIFY=1` | Dual ctx verify (structurally slower; see below) |
-| `DSPARK_NO_GPU_GREEDY=1` | Force CPU greedy accept (full vocab logits D2H) |
-| `DSPARK_NO_DEFER_LAYER_INP=1` | Extract all layer rows during verify decode |
+| `DSPARK_GPU_GREEDY=1` | Opt-in GPU argmax accept (experimental; default off) |
+| `DSPARK_NO_GPU_GREEDY=1` | Force CPU greedy accept (default path) |
+| `DSPARK_NO_DEFER_LAYER_INP=1` | Full layer D2H on every verify row (slower) |
 
 ### Reading pp vs tgp
 
@@ -63,12 +64,11 @@ Spec pp is not comparable to vanilla pp (extra setup). **tgp speedup is the head
 |--------|-------------|-------|
 | Batched verify + greedy accept fast-path | Large | Core architecture |
 | Shorter draft decode (`n_draft+1`) + per-length `block_gpu` | Moderate | Real GPU savings on draft |
-| GPU greedy verify accept (skip logits D2H) | TBD | Vulkan argmax on logits rows |
-| Deferred partial layer-input D2H | TBD | Only committed rows after accept |
-| Verify-sized graph warmup (`n_max+1`) | TBD | `llama_graph_reserve` at DSpark init |
-| `n_max=4` sweet spot | ~same tgp as n_max=3, **token match YES** | Config, not thermal |
-| Process sync skip (short batches) | Noise | <1% |
-| Adaptive n_max | Variance | Disabled for fair runs |
+| **Deferred partial layer D2H** | **~1-2%** | Correctness fix + skips rejected-row D2H |
+| Verify-sized graph warmup (`n_max+1`) | Noise | Pre-alloc at init |
+| `n_max=4` sweet spot | Best speed + **token match YES** | Config, not thermal |
+| GPU greedy verify (opt-in) | **broken / slow** | Per-step graph alloc; default off |
+| Adaptive n_max | Variance | 1.51x vs 1.62x fixed on code_500l |
 
 ### What is NOT real
 
@@ -76,20 +76,35 @@ Spec pp is not comparable to vanilla pp (extra setup). **tgp speedup is the head
 |----------|-------------|-----|
 | Spec-first bench order | +10-15% fake speedup | Vanilla runs hot |
 | Split verify (dual ctx) | **0.79-1.04x** | 2nd target forward >> layer-tap savings |
-| flash-attn on/off | **neutral** (~1.52-1.58x) | Within variance |
+| flash-attn on/off | **neutral** | ~1.5-1.7x within variance |
 | ubatch 256-2048 | **neutral** | Within variance |
 | `-c 512` vs `1024` | **neutral** | Within variance |
+| `n_max=7` on coding | **0.96x, match NO** | Quality drift |
 
-### Bottleneck (honest)
+### Bottleneck (honest, measured 2026-06-29)
 
-Verify step ~110-128 ms/step = **12B Q4 batched forward on 4-5 tokens** + GPU fence.
-`decode_submit_ms` ~2 ms (async return); almost all time is GPU matmul, not CPU or layer D2H.
-Layer-input taps are views on existing forward activations; disabling them via split-verify
-still requires a second forward on committed tokens and loses badly.
+Per verify step (n_max=4, fair, defer layer on):
 
-**2x fair tgp is not reachable by config tuning alone.** From fair **~1.61x**, need ~25% more.
-Real paths: faster target batched decode (graph/kernel), or higher acceptance without larger
-verify batches (draft model quality).
+| Phase | ms/step | Notes |
+|-------|---------|-------|
+| decode submit (async return) | ~3 | `llama_decode` returns before GPU done |
+| **GPU forward + logits fence** | **~60** | Dominates verify; labeled "accept" in harness |
+| layer commit (partial D2H) | ~0.2 | Deferred path only |
+| process (encode + inject) | ~1.3 | Not the limiter |
+| draft step | ~18 | Separate from verify |
+
+**The ~60 ms is 12B Q4 batched forward on 5 tokens**, not CPU argmax or layer D2H.
+Vanilla 1-token forward is ~38 ms. Batching 5 tokens costs ~1.6x not 5x (good).
+
+**2-3x coding target math (from ~1.62x fair):**
+
+| Target | Required | Realistic path |
+|--------|----------|----------------|
+| **2.0x** | +23% tgp | ~3.1 accept/step at same verify ms, OR verify 60->46 ms (-23%) |
+| **3.0x** | +85% tgp | Both: verify ~40 ms AND accept ~3.5+/step, OR draft model quality leap |
+
+Config tuning alone will not reach 2x. Need **target batched-decode kernel/graph work**
+and/or **higher acceptance without quality loss**.
 
 ## Fair throughput results
 
@@ -97,15 +112,16 @@ All: `-c 1024`, `temp=0`, `seed=42`, vanilla-first + 3s cooldown, `DSPARK_NO_ADA
 
 ### Coding (`code_500l`, n_predict=400)
 
-| n_max | pp van | tgp van | pp spec* | tgp spec | **Speedup** | Accept/step | Verify ms | Match |
-|-------|--------|---------|----------|----------|-------------|-------------|-----------|-------|
-| **4** | - | **25.48** | - | **41.15** | **1.61x** | 2.50 | 128 | **YES** |
-| 3 | - | 25.58 | - | 40.98 | 1.60x | 2.05 | 111 | NO |
-| 2 | - | 25.64 | - | 39.49 | 1.54x | 1.46 | 93 | NO |
+| Config | tgp van | tgp spec | **Speedup** | Accept/step | Verify ms | Match |
+|--------|---------|----------|-------------|-------------|-----------|-------|
+| **defer layer (default)** | ~26.1 | **~42.2** | **1.62x** | 2.50 | ~64 | **YES** |
+| no defer layer | ~26.0 | ~26.5 | 1.02x | 2.50 | ~201 | YES |
+| adaptive n_max | ~26.1 | ~39.4 | 1.51x | 2.50 | ~69 | YES |
+| GPU greedy (broken) | ~26.0 | ~35.5 | 1.37x | 3.89* | ~236 | NO |
 
-\* spec pp includes one-time setup (~270 ms); not compared here.
+\* GPU greedy reported fake 97% hit rate on wrong tokens.
 
-**Sweet spot: `n_max=4`** - best fair speedup with greedy token match at temp=0.
+**Sweet spot: `n_max=4`, defer layer on, CPU greedy accept.**
 
 ### Agentic (`agentic_plan`, n_predict=300)
 
@@ -116,56 +132,27 @@ All: `-c 1024`, `temp=0`, `seed=42`, vanilla-first + 3s cooldown, `DSPARK_NO_ADA
 
 Agentic acceptance ~1.3-1.6/step limits speedup. **1.5x fair target not met** (~7% gap).
 
-### Config sweeps (fair order, same session - thermal drift between runs)
-
-Long back-to-back sweeps are unreliable. Isolated fair runs above are authoritative.
-
-| Config | Approx fair speedup | Verdict |
-|--------|---------------------|---------|
-| flash-attn on | 1.58x | neutral |
-| flash-attn off | 1.52x | neutral |
-| ubatch=512 | 1.58x | neutral |
-| `-c 512/2048` | ~1.12-1.54x | neutral vs 1024 |
-
-### General prose (`essay_100w`)
-
-Low acceptance (~1.1/step) -> spec **slower** than vanilla. Do not use DSpark for this workload.
-
 ## Targets vs fair reality
 
-| Workload | Target | Fair best | tgp van -> spec | Gap |
-|----------|--------|-----------|-----------------|-----|
-| Coding | 2.0x | **1.61x** | 25.5 -> 41.2 tok/s | ~24% |
-| Agentic | 1.5x | **1.40x** | 25.6 -> 35.9 tok/s | ~7% |
-
-A **5-10% structural gain** on coding would mean fair **1.69-1.77x** - not yet achieved.
-
-## Per-step timing (fair, code_500l, n_max=4)
-
-| Phase | ms/step |
-|-------|---------|
-| vanilla forward (1 tok) | ~39 |
-| draft (fwd + GPU sample) | ~19 |
-| verify (batched + sync) | ~128 |
-| process (encode + inject) | ~1 |
+| Workload | Target | Fair best | Gap to 2x | Gap to 3x |
+|----------|--------|-----------|-----------|-----------|
+| Coding | 2-3x | **1.62x** | 24% | 85% |
+| Agentic | 1.5x | 1.40x | n/a | n/a |
 
 ## Experiment log
 
 | Date | Commit | Change | Fair coding speedup |
 |------|--------|--------|---------------------|
-| 2026-06-29 | 05ecf8a | Batched verify + greedy accept | ~1.5x (early, spec-first) |
-| 2026-06-29 | 5298fbd | Shorter draft blocks + block_gpu | +config |
-| 2026-06-29 | 889ae1063 | Adaptive upscale, profiling | spec-first inflated |
-| 2026-06-29 | bdf0f0308 | pp/tgp table, process sync skip | spec-first inflated |
-| 2026-06-29 | 843457e | **Fair harness** (vanilla-first + cooldown) | **1.61x** honest |
-| 2026-06-29 | f360dae | GPU greedy verify + defer layer D2H + verify graph warmup | re-run fair bench |
+| 2026-06-29 | 843457e | Fair harness (vanilla-first + cooldown) | 1.61x |
+| 2026-06-29 | f360dae | GPU greedy + defer layer + warmup (defer buggy) | regressed |
+| 2026-06-29 | (pending) | Fix defer sync; timing; GPU greedy opt-in | **1.62x** |
 
-## Open work (structural only)
+## Open work (structural, ordered by impact)
 
-1. **Target verify forward** - llama graph / Vulkan kernel for small batched decode (only path to 2x)
-2. **Agentic acceptance** - draft model / prompt class, not verify ms
-3. **Token match at temp=0** - n_max=4 matches; n_max=3 drifts on Q4 batched path
-4. **Re-benchmark** GPU greedy + defer layer + verify warmup (fair protocol above)
+1. **Faster 5-token target forward** - llama graph reuse audit, Vulkan small-batch matmul, fused per-row argmax in graph (skip logits D2H; saves little if forward dominates)
+2. **Higher coding acceptance** - draft model / Q4 numerics; n_max>4 hurts match
+3. **Fix GPU greedy path** - cached argmax graph, correct row stride; opt-in only
+4. **Agentic acceptance** - prompt-class limiter, not verify ms
 
 ## How to append results
 
@@ -176,7 +163,7 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   --spec-type draft-dspark -c 1024 -ngl 99 -ngld 99 --temp 0 --seed 42 \
   --spec-draft-n-max 4 -n 400 2>&1 | tee /tmp/bench.out
 
-grep -E 'generated:|throughput|tgp speedup|mean accepted|token match' /tmp/bench.out
+grep -E 'generated:|throughput|tgp speedup|mean accepted|token match|verify step|accept \(GPU|layer commit' /tmp/bench.out
 ```
 
 Record: date, commit, prompt, n, n_max, **pp van/spec, tgp van/spec**, speedup, accept/step, match.

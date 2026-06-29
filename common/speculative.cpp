@@ -1446,11 +1446,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                 if (markov_gpu && !getenv("DSPARK_NO_BLOCK_GPU")) {
                     block_gpu_by_n.resize((size_t) block_size + 1);
-                    block_gpu_by_n[(size_t) block_size] = llama_dspark_block_sample_gpu_init(
-                            model_dft, block_size, dspark_w.logit_softcap);
-                    LOG_INF("%s: - greedy block sampler on %s (up to block_size=%d)\n", __func__,
-                            block_gpu_by_n[(size_t) block_size] ? "GPU (fused single-submit)" : "CPU per-position",
-                            block_size);
+                    for (int32_t n = 2; n <= block_size; ++n) {
+                        block_gpu_by_n[(size_t) n] = llama_dspark_block_sample_gpu_init(
+                                model_dft, n, dspark_w.logit_softcap);
+                    }
+                    LOG_INF("%s: - greedy block sampler on GPU (sizes 2..%d)\n", __func__, block_size);
                 }
             }
         }
@@ -3316,6 +3316,7 @@ bool common_speculative_dspark_verify_batched(
     const bool gpu_greedy = draft_probs == nullptr
             && (temp == 0.0f || temp == -1.0f)
             && common_sampler_is_pure_greedy(smpl)
+            && getenv("DSPARK_GPU_GREEDY") != nullptr
             && getenv("DSPARK_NO_GPU_GREEDY") == nullptr;
 
     const bool defer_layers = !split_verify && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
@@ -3363,16 +3364,25 @@ bool common_speculative_dspark_verify_batched(
         out_ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
     }
 
+    if (timing) {
+        const int64_t t1_end = ggml_time_us();
+        timing->decode_submit_ms   = 1e-3 * (t_decode - t0);
+        timing->accept_ms          = 1e-3 * (t1_end - t1);
+        // GPU forward completion + logits D2H fence (decode returns before GPU done)
+        timing->logits_decode_ms   = 1e-3 * (t_decode - t0);
+    }
+
+    const int64_t t_commit = timing ? ggml_time_us() : 0;
+
     if (defer_layers) {
         llama_commit_layer_inputs(ctx_tgt, out_ids.size());
         llama_set_defer_layer_inp_extract(ctx_tgt, false);
     }
 
-    if (timing) {
-        const int64_t t1_end = ggml_time_us();
-        timing->decode_submit_ms   = 1e-3 * (t_decode - t0);
-        timing->accept_ms          = 1e-3 * (t1_end - t1);
-        timing->logits_decode_ms   = 1e-3 * (t1_end - t0);
+    if (timing && defer_layers) {
+        timing->layer_commit_ms = 1e-3 * (ggml_time_us() - t_commit);
+    } else if (timing) {
+        timing->layer_commit_ms = 0;
     }
 
     if (out_ids.empty()) {

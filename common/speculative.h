@@ -75,11 +75,12 @@ void common_speculative_sync_params(common_speculative * spec, const common_para
 void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
 
 struct common_speculative_dspark_verify_timing {
-    double decode_submit_ms = 0; // llama_decode only (no GPU sync)
-    double logits_decode_ms = 0; // decode + accept sync
-    double accept_ms        = 0;
+    double decode_submit_ms   = 0; // llama_decode return (async, no GPU sync)
+    double logits_decode_ms   = 0; // same as decode_submit_ms (legacy alias)
+    double accept_ms          = 0; // GPU fence + greedy argmax on host logits
+    double layer_commit_ms    = 0; // partial layer D2H after accept (defer path)
     double features_decode_ms = 0;
-    double process_ms       = 0;
+    double process_ms         = 0;
 };
 
 // DSpark: after logits-only verify + accept, re-decode committed prefix with features on and

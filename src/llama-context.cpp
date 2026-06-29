@@ -1174,6 +1174,10 @@ bool llama_context::commit_layer_inputs(size_t n_tokens) {
 
     extract_layer_inputs(defer_layer_res, defer_layer_token_offset, n_tokens);
     defer_layer_res = nullptr;
+
+    // layer D2H is async; process() skips sync for small batches
+    synchronize();
+
     return true;
 }
 
@@ -1208,7 +1212,7 @@ static bool gpu_argmax_logits_rows(
 
     for (int32_t i = 0; i < n_rows; ++i) {
         const int64_t row = rows[i];
-        ggml_tensor * view = ggml_view_1d(ctx, t_logits, n_vocab, (size_t) row * (size_t) n_vocab * sizeof(float));
+        ggml_tensor * view = ggml_view_1d(ctx, t_logits, n_vocab, (size_t) row * t_logits->nb[1]);
         ggml_tensor * tok  = ggml_argmax(ctx, view);
         ggml_set_output(tok);
         ggml_build_forward_expand(gf, tok);
