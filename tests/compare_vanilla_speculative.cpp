@@ -107,10 +107,14 @@ static int run_speculative(
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-    // warmup target graphs (especially after ctx_tgt_feat creation / first split-verify step)
+    // warmup target graphs at verify batch size (n_max + 1 tokens)
     {
-        llama_batch warm = llama_batch_init(1, 0, 1);
-        common_batch_add(warm, inp.empty() ? 0 : inp[0], 0, { 0 }, true);
+        const int32_t n_verify = params.speculative.draft.n_max + 1;
+        llama_batch warm = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+        const llama_token warm_tok = inp.empty() ? 0 : inp[0];
+        for (int32_t i = 0; i < n_verify; ++i) {
+            common_batch_add(warm, warm_tok, (llama_pos) i, { 0 }, true);
+        }
         llama_decode(ctx_tgt, warm);
         llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
         if (ctx_feat) {

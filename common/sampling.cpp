@@ -5,6 +5,8 @@
 #include "log.h"
 #include "reasoning-budget.h"
 
+#include "../src/llama-ext.h"
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -706,6 +708,38 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
 llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab) {
     return greedy_argmax_token(logits, n_vocab);
+}
+
+std::vector<llama_token> common_sampler_greedy_accept_n_gpu(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    llama_token out_buf[16];
+    int32_t n_out = 0;
+
+    if (!llama_greedy_verify_accept(
+                ctx,
+                idxs.data(),
+                (int32_t) idxs.size(),
+                draft.data(),
+                (int32_t) draft.size(),
+                out_buf,
+                &n_out)) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false);
+    }
+
+    for (int32_t i = 0; i < n_out; ++i) {
+        common_sampler_accept(gsmpl, out_buf[i], true);
+        result.push_back(out_buf[i]);
+    }
+
+    return result;
 }
 
 llama_token common_sampler_sample_after_sync(

@@ -43,6 +43,8 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
 | `DSPARK_NO_ADAPTIVE_NMAX=1` | Fixed n_max (required for fair sweeps) |
 | `DSPARK_PROF=1` | Draft forward vs sampling split |
 | `DSPARK_SPLIT_VERIFY=1` | Dual ctx verify (structurally slower; see below) |
+| `DSPARK_NO_GPU_GREEDY=1` | Force CPU greedy accept (full vocab logits D2H) |
+| `DSPARK_NO_DEFER_LAYER_INP=1` | Extract all layer rows during verify decode |
 
 ### Reading pp vs tgp
 
@@ -61,6 +63,9 @@ Spec pp is not comparable to vanilla pp (extra setup). **tgp speedup is the head
 |--------|-------------|-------|
 | Batched verify + greedy accept fast-path | Large | Core architecture |
 | Shorter draft decode (`n_draft+1`) + per-length `block_gpu` | Moderate | Real GPU savings on draft |
+| GPU greedy verify accept (skip logits D2H) | TBD | Vulkan argmax on logits rows |
+| Deferred partial layer-input D2H | TBD | Only committed rows after accept |
+| Verify-sized graph warmup (`n_max+1`) | TBD | `llama_graph_reserve` at DSpark init |
 | `n_max=4` sweet spot | ~same tgp as n_max=3, **token match YES** | Config, not thermal |
 | Process sync skip (short batches) | Noise | <1% |
 | Adaptive n_max | Variance | Disabled for fair runs |
@@ -152,14 +157,15 @@ A **5-10% structural gain** on coding would mean fair **1.69-1.77x** - not yet a
 | 2026-06-29 | 5298fbd | Shorter draft blocks + block_gpu | +config |
 | 2026-06-29 | 889ae1063 | Adaptive upscale, profiling | spec-first inflated |
 | 2026-06-29 | bdf0f0308 | pp/tgp table, process sync skip | spec-first inflated |
-| 2026-06-29 | (pending) | **Fair harness** (vanilla-first + cooldown) | **1.61x** honest |
+| 2026-06-29 | 843457e | **Fair harness** (vanilla-first + cooldown) | **1.61x** honest |
+| 2026-06-29 | (pending) | GPU greedy verify + defer layer D2H + verify graph warmup | re-run fair bench |
 
 ## Open work (structural only)
 
 1. **Target verify forward** - llama graph / Vulkan kernel for small batched decode (only path to 2x)
 2. **Agentic acceptance** - draft model / prompt class, not verify ms
 3. **Token match at temp=0** - n_max=4 matches; n_max=3 drifts on Q4 batched path
-4. **Deferred layer D2H** - unlikely >=5% (rejected positions are ~1 row of D2H)
+4. **Re-benchmark** GPU greedy + defer layer + verify warmup (fair protocol above)
 
 ## How to append results
 

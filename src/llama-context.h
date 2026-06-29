@@ -115,6 +115,16 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_defer_layer_inp_extract(bool value);
+    void set_skip_host_logits(bool value);
+    bool commit_layer_inputs(size_t n_tokens);
+    bool greedy_verify_accept(
+            const int32_t * batch_idxs,
+            int32_t         n_idxs,
+            const llama_token * draft,
+            int32_t         n_draft,
+            llama_token *   out,
+            int32_t *       n_out);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -233,6 +243,9 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    const llm_graph_result * defer_layer_res         = nullptr;
+    size_t                   defer_layer_token_offset = 0;
 
     //
     // graph

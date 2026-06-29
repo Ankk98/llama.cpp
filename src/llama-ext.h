@@ -116,6 +116,23 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 LLAMA_API float * llama_get_embeddings_layer_inp_no_sync(struct llama_context * ctx, uint32_t lid);
 
+// Defer layer-input D2H until commit_layer_inputs() after speculative accept (saves rejected rows).
+LLAMA_API void llama_set_defer_layer_inp_extract(struct llama_context * ctx, bool value);
+LLAMA_API bool llama_commit_layer_inputs(struct llama_context * ctx, size_t n_tokens);
+
+// Skip full-vocab logits D2H during decode; use with llama_greedy_verify_accept().
+LLAMA_API void llama_set_skip_host_logits(struct llama_context * ctx, bool value);
+
+// Greedy argmax on GPU logits rows (batch_idxs length = n_draft + 1). temp=0 only.
+LLAMA_API bool llama_greedy_verify_accept(
+        struct llama_context * ctx,
+        const int32_t     * batch_idxs,
+        int32_t             n_idxs,
+        const llama_token * draft,
+        int32_t             n_draft,
+        llama_token       * out,
+        int32_t           * n_out);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

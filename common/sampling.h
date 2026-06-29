@@ -87,6 +87,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 bool common_sampler_is_pure_greedy(const struct common_sampler * gsmpl);
 
+// GPU argmax on verify logits rows (caller must set skip_host_logits before decode).
+std::vector<llama_token> common_sampler_greedy_accept_n_gpu(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft);
+
 llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab);
 
 llama_token common_sampler_sample_after_sync(

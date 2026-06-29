@@ -48,6 +48,8 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool defer_layer_inp_extract = false;   // skip layer D2H during decode; commit after accept
+    bool skip_host_logits        = false;   // skip full-vocab logits D2H (GPU greedy verify)
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
