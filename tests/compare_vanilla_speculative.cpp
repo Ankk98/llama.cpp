@@ -150,6 +150,14 @@ static int run_speculative(
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
 
+        if (getenv("DSPARK_DEBUG") && out->n_propose_steps <= 12) {
+            fprintf(stderr, "[step %2d] draft:", out->n_propose_steps);
+            for (auto d : draft) fprintf(stderr, " %d", (int) d);
+            fprintf(stderr, "  | target:");
+            for (auto t : ids) fprintf(stderr, " %d", (int) t);
+            fprintf(stderr, "  | accepted %d/%d\n", n_acc, (int) draft.size());
+        }
+
         common_speculative_accept(spec, 0, (uint16_t) n_acc);
         n_past += n_acc;
         for (auto t : ids) {
