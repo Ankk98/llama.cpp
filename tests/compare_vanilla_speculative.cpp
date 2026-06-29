@@ -294,7 +294,7 @@ int main(int argc, char ** argv) {
     const bool has_draft = !params.speculative.draft.mparams.path.empty();
     if (has_draft) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
-        params.speculative.draft.n_max = 5;
+        // keep params.speculative.draft.n_max from --spec-draft-n-max (default 3)
     }
 
     llama_backend_init();
@@ -355,16 +355,18 @@ int main(int argc, char ** argv) {
     run_stats vanilla {};
     run_stats spec_stats {};
 
-    if (has_draft) {
-        if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
-            return 1;
-        }
+    // Run vanilla first so the baseline is measured on a cold GPU; speculative
+    // pays any thermal cost and speedup is not inflated by run order.
+    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+        return 1;
     }
 
     common_sampler_reset(smpl.get());
 
-    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
-        return 1;
+    if (has_draft) {
+        if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+            return 1;
+        }
     }
 
     fprintf(stderr, "\n=== Vanilla (target only) ===\n");

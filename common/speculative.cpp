@@ -1333,8 +1333,23 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     llama_dspark_markov_gpu * markov_gpu = nullptr;
 
     // fused single-submit greedy block sampler (softcap + markov + argmax for the whole block)
-    llama_dspark_block_sample_gpu * block_gpu = nullptr;
-    std::vector<float>              block_logits;
+    // one handle per active block length (lazy); shorter blocks when n_max < block_size
+    std::vector<llama_dspark_block_sample_gpu *> block_gpu_by_n;
+    std::vector<float>                           block_logits;
+
+    llama_dspark_block_sample_gpu * block_gpu_for(int32_t n_active) {
+        if (n_active <= 0) {
+            return nullptr;
+        }
+        if ((int) block_gpu_by_n.size() <= n_active) {
+            block_gpu_by_n.resize((size_t) n_active + 1);
+        }
+        if (!block_gpu_by_n[(size_t) n_active]) {
+            block_gpu_by_n[(size_t) n_active] = llama_dspark_block_sample_gpu_init(
+                    llama_get_model(params.ctx_dft), n_active, dspark_w.logit_softcap);
+        }
+        return block_gpu_by_n[(size_t) n_active];
+    }
 
     std::vector<std::mt19937> rngs;
 
@@ -1410,9 +1425,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 LOG_INF("%s: - markov head running on %s\n", __func__, markov_gpu ? "GPU/backend" : "CPU");
 
                 if (markov_gpu && !getenv("DSPARK_NO_BLOCK_GPU")) {
-                    block_gpu = llama_dspark_block_sample_gpu_init(model_dft, block_size, dspark_w.logit_softcap);
-                    LOG_INF("%s: - greedy block sampler on %s\n", __func__,
-                            block_gpu ? "GPU (fused single-submit)" : "CPU per-position");
+                    block_gpu_by_n.resize((size_t) block_size + 1);
+                    block_gpu_by_n[(size_t) block_size] = llama_dspark_block_sample_gpu_init(
+                            model_dft, block_size, dspark_w.logit_softcap);
+                    LOG_INF("%s: - greedy block sampler on %s (up to block_size=%d)\n", __func__,
+                            block_gpu_by_n[(size_t) block_size] ? "GPU (fused single-submit)" : "CPU per-position",
+                            block_size);
                 }
             }
         }
@@ -1450,8 +1468,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         if (markov_gpu) {
             llama_dspark_markov_gpu_free(markov_gpu);
         }
-        if (block_gpu) {
-            llama_dspark_block_sample_gpu_free(block_gpu);
+        for (auto * h : block_gpu_by_n) {
+            if (h) {
+                llama_dspark_block_sample_gpu_free(h);
+            }
         }
     }
 
@@ -1588,9 +1608,17 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
             }
+            // on low hit-rate prompts, shorter blocks cut verify cost more than they hurt acceptance
+            if (!getenv("DSPARK_NO_ADAPTIVE_NMAX") && n_acc_drafts >= 8 && n_gen_tokens > 0) {
+                const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
+                if (hit < 0.58f) {
+                    n_draft = std::min(n_draft, 2);
+                }
+            }
             n_draft = std::min(n_draft, block_size);
 
-            const int32_t n_block_tokens = block_size;
+            // when confidence is off, only decode anchor + n_draft masks (not the full trained block)
+            const int32_t n_block_tokens = use_confidence ? block_size : std::min(block_size, n_draft + 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block[seq_id]     = n_block_tokens;
 
@@ -1598,8 +1626,6 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, anchor_pos + i, { seq_id }, true);
             }
-
-            (void) n_draft;
         }
 
         if (batch.n_tokens == 0) {
@@ -1639,6 +1665,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
             }
+            if (!getenv("DSPARK_NO_ADAPTIVE_NMAX") && n_acc_drafts >= 8 && n_gen_tokens > 0) {
+                const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
+                if (hit < 0.58f) {
+                    n_draft = std::min(n_draft, 2);
+                }
+            }
             n_draft = std::min(n_draft, block_size);
 
             const int32_t beg = i_block_beg[seq_id];
@@ -1657,32 +1689,34 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             llama_token prev_token = dp.id_last;
 
+            const int32_t n_block_tokens = n_block[seq_id];
+
             const bool  use_markov = !disable_markov && dspark_w.markov_rank > 0;
             const float softcap    = dspark_w.logit_softcap;
 
             // fused single-submit GPU path: greedy, markov on, no probs/confidence needed.
-            // gathers the block logits and runs softcap+markov+argmax for all positions in one
-            // graph dispatch, reading back only the block_size token ids (no n_vocab copyback).
             bool block_done = false;
+            llama_dspark_block_sample_gpu * const block_gpu = block_gpu_for(n_block_tokens);
             if (block_gpu && use_markov && temperature < 1e-5f && !dp.draft_probs && !use_confidence) {
                 // the block positions' logits are contiguous in the output buffer in the common
                 // (single-seq) case, so pass them directly; only gather/copy when they are not
                 const float * base = llama_get_logits_ith(ctx_dft, beg);
                 GGML_ASSERT(base);
                 const float * block_ptr = base;
-                if (llama_get_logits_ith(ctx_dft, beg + block_size - 1) != base + (size_t) (block_size - 1) * n_vocab) {
-                    block_logits.resize((size_t) block_size * n_vocab);
-                    for (int32_t i = 0; i < block_size; ++i) {
+                if (llama_get_logits_ith(ctx_dft, beg + n_block_tokens - 1) !=
+                        base + (size_t) (n_block_tokens - 1) * n_vocab) {
+                    block_logits.resize((size_t) n_block_tokens * n_vocab);
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
                         const float * lp = llama_get_logits_ith(ctx_dft, beg + i);
                         GGML_ASSERT(lp);
                         std::memcpy(block_logits.data() + (size_t) i * n_vocab, lp, (size_t) n_vocab * sizeof(float));
                     }
                     block_ptr = block_logits.data();
                 }
-                std::vector<int32_t> toks(block_size);
+                std::vector<int32_t> toks(n_block_tokens);
                 const int64_t t_b0 = prof ? ggml_time_us() : 0;
                 if (llama_dspark_block_sample_gpu_run(block_gpu, block_ptr, (int32_t) dp.id_last, toks.data())) {
-                    for (int32_t i = 0; i < block_size; ++i) {
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
                         sampled.push_back((llama_token) toks[i]);
                     }
                     block_done = true;
@@ -1692,7 +1726,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 }
             }
 
-            for (int32_t i = 0; !block_done && i < block_size; ++i) {
+            for (int32_t i = 0; !block_done && i < n_block_tokens; ++i) {
                 const float * raw_logits = llama_get_logits_ith(ctx_dft, beg + i);
                 GGML_ASSERT(raw_logits);
 
@@ -1767,12 +1801,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 }
             }
 
-            int proposal_len = block_size;
+            int proposal_len = n_block_tokens;
             if (use_confidence && !conf_logits.empty()) {
                 proposal_len = dspark_confident_prefix_length(
                         conf_logits, block_size, confidence_threshold);
             } else {
-                proposal_len = std::min(block_size, n_draft);
+                proposal_len = std::min(n_block_tokens, n_draft);
             }
 
             if (proposal_len <= 0) {
@@ -3250,10 +3284,9 @@ bool common_speculative_dspark_verify_batched(
     if (llama_decode(ctx_tgt, batch) != 0) {
         return false;
     }
-    llama_synchronize(ctx_tgt);
 
     if (timing) {
-        timing->logits_decode_ms = 1e-3 * (ggml_time_us() - t0);
+        timing->logits_decode_ms = 0; // filled in with accept (includes GPU sync)
     }
 
     const int64_t t1 = timing ? ggml_time_us() : 0;
@@ -3270,7 +3303,9 @@ bool common_speculative_dspark_verify_batched(
     }
 
     if (timing) {
-        timing->accept_ms = 1e-3 * (ggml_time_us() - t1);
+        const int64_t t1_end = ggml_time_us();
+        timing->accept_ms        = 1e-3 * (t1_end - t1);
+        timing->logits_decode_ms = 1e-3 * (t1_end - t0);
     }
 
     if (out_ids.empty()) {
