@@ -162,6 +162,40 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    void set_logits_no_sync(struct llama_context * ctx, int idx) {
+        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        if (sampled_probs) {
+            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+            cur.resize(sampled_probs_count);
+            for (uint32_t i = 0; i < sampled_probs_count; ++i) {
+                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+            }
+        } else if (sampled_logits) {
+            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+            cur.resize(sampled_logits_count);
+            for (uint32_t i = 0; i < sampled_logits_count; i++) {
+                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+            }
+        } else {
+            const auto * logits = llama_get_logits_ith_no_sync(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            cur.resize(n_vocab);
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            }
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -538,10 +572,52 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+bool common_sampler_is_pure_greedy(const common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
 
-    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+    const auto & p = gsmpl->params;
+
+    if (p.temp >= 1e-5f) {
+        return false;
+    }
+    if (gsmpl->grmr || gsmpl->rbudget) {
+        return false;
+    }
+    if (p.has_logit_bias() || p.backend_sampling || p.mirostat != 0) {
+        return false;
+    }
+    if (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f) {
+        return false;
+    }
+    if (p.dry_multiplier != 0.0f) {
+        return false;
+    }
+
+    return true;
+}
+
+static llama_token greedy_argmax_token(const float * logits, int n_vocab) {
+    int best = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > logits[best]) {
+            best = i;
+        }
+    }
+    return (llama_token) best;
+}
+
+static llama_token common_sampler_sample_impl(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first,
+        bool already_synced) {
+    if (!already_synced) {
+        llama_synchronize(ctx);
+    }
+
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
@@ -549,12 +625,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
-    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+    auto & cur_p = gsmpl->cur_p;
 
-    gsmpl->set_logits(ctx, idx);
+    if (already_synced) {
+        gsmpl->set_logits_no_sync(ctx, idx);
+    } else {
+        gsmpl->set_logits(ctx, idx);
+    }
 
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -575,7 +653,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
@@ -590,7 +667,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         return id;
     }
 
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
     {
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
@@ -603,9 +679,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    if (already_synced) {
+        gsmpl->set_logits_no_sync(ctx, idx);
+    } else {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -622,15 +700,72 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, false);
+}
+
+llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab) {
+    return greedy_argmax_token(logits, n_vocab);
+}
+
+llama_token common_sampler_sample_after_sync(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, grammar_first, true);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // pure greedy: one sync after the batched verify decode, then argmax per position with no
+    // full-vocab candidate build and no per-position GPU fences
+    if (!grammar_first && common_sampler_is_pure_greedy(gsmpl)) {
+        llama_synchronize(ctx);
+
+        const llama_model * model = llama_get_model(ctx);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+        size_t i = 0;
+        for (; i < draft.size(); i++) {
+            const float * logits = llama_get_logits_ith_no_sync(ctx, idxs[i]);
+            GGML_ASSERT(logits != nullptr);
+
+            const llama_token id = greedy_argmax_token(logits, n_vocab);
+
+            common_sampler_accept(gsmpl, id, true);
+
+            result.push_back(id);
+
+            if (draft[i] != id) {
+                break;
+            }
+        }
+
+        if (i == draft.size()) {
+            const float * logits = llama_get_logits_ith_no_sync(ctx, idxs[i]);
+            GGML_ASSERT(logits != nullptr);
+
+            const llama_token id = greedy_argmax_token(logits, n_vocab);
+
+            common_sampler_accept(gsmpl, id, true);
+
+            result.push_back(id);
+        }
+
+        return result;
+    }
+
+    // general path: one sync for the whole accept loop, then read logits without re-syncing
+    llama_synchronize(ctx);
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample_impl(gsmpl, ctx, idxs[i], grammar_first, true);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -642,7 +777,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = common_sampler_sample_impl(gsmpl, ctx, idxs[i], grammar_first, true);
 
         common_sampler_accept(gsmpl, id, true);
 

@@ -85,6 +85,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+bool common_sampler_is_pure_greedy(const struct common_sampler * gsmpl);
+
+llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab);
+
+llama_token common_sampler_sample_after_sync(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first);
+
 // DSpark verify with rejection sampling using external post-Markov draft_probs
 std::vector<llama_token> common_sampler_sample_and_accept_n_dspark(
         struct common_sampler * gsmpl,

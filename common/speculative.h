@@ -71,6 +71,54 @@ void common_speculative_draft(common_speculative * spec);
 // update runtime DSpark options (temp/seed/confidence) before drafting
 void common_speculative_sync_params(common_speculative * spec, const common_params_speculative & params);
 
+// DSpark: toggle expensive target layer-input extraction (5 hidden tensors per token)
+void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
+
+struct common_speculative_dspark_verify_timing {
+    double logits_decode_ms = 0;
+    double accept_ms        = 0;
+    double features_decode_ms = 0;
+    double process_ms       = 0;
+};
+
+// DSpark: after logits-only verify + accept, re-decode committed prefix with features on and
+// run process() for the draft encoder / KV injection increment
+bool common_speculative_dspark_process_committed(
+        common_speculative * spec,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed_ids,
+        struct llama_batch & batch);
+
+// DSpark: optimized batched verify (single target forward with layer features, truncated process)
+bool common_speculative_dspark_verify_batched(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        struct llama_batch & batch,
+        common_speculative_dspark_verify_timing * timing = nullptr,
+        const std::vector<std::vector<float>> * draft_probs = nullptr,
+        float temp = 0.0f);
+
+// DSpark: sequential early-exit target verify (one token/decode, stop at first mismatch)
+bool common_speculative_dspark_verify_sequential(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        struct llama_batch & batch);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

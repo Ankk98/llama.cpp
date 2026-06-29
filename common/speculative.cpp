@@ -181,6 +181,9 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // DSpark only: toggle target layer-input extraction (expensive; keep off during verify logits)
+    virtual void dspark_target_features_enable(bool /*enable*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1783,6 +1786,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         // noop - context injection in process() is position-addressed
     }
 
+    void dspark_target_features_enable(bool enable) override {
+        auto * ctx_tgt = params.ctx_tgt;
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], enable);
+        }
+    }
+
     void sync_params(const common_params_speculative & params) override {
         temperature          = params.dspark_temp;
         confidence_threshold = params.dspark_confidence_threshold;
@@ -3132,6 +3142,190 @@ void common_speculative_sync_params(common_speculative * spec, const common_para
     for (auto & impl : spec->impls) {
         impl->sync_params(params);
     }
+}
+
+void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->dspark_target_features_enable(enable);
+    }
+}
+
+static void dspark_build_committed_batch(
+        llama_batch & batch,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed_ids) {
+    common_batch_clear(batch);
+    for (size_t i = 0; i < committed_ids.size(); ++i) {
+        const llama_token tok = (i == 0) ? anchor : committed_ids[i - 1];
+        common_batch_add(batch, tok, pos_verify + (llama_pos) i, { seq_id }, false);
+    }
+}
+
+bool common_speculative_dspark_process_committed(
+        common_speculative * spec,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed_ids,
+        llama_batch & batch) {
+    if (spec == nullptr || committed_ids.empty()) {
+        return true;
+    }
+
+    common_speculative_dspark_target_features_enable(spec, true);
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+
+    dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, committed_ids);
+
+    if (llama_decode(ctx_tgt, batch) != 0) {
+        return false;
+    }
+
+    return common_speculative_process(spec, batch);
+}
+
+// Batched verify: one target forward for the full draft block (layer features stay enabled to
+// avoid per-step graph realloc from toggling), accept, then process() only on the committed prefix.
+bool common_speculative_dspark_verify_batched(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        llama_batch & batch,
+        common_speculative_dspark_verify_timing * timing,
+        const std::vector<std::vector<float>> * draft_probs,
+        float temp) {
+    out_ids.clear();
+
+    if (spec == nullptr || smpl == nullptr || ctx_tgt == nullptr) {
+        return false;
+    }
+
+    common_batch_clear(batch);
+    common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
+    for (size_t i = 0; i < draft.size(); ++i) {
+        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_id }, true);
+    }
+
+    const int64_t t0 = timing ? ggml_time_us() : 0;
+
+    if (llama_decode(ctx_tgt, batch) != 0) {
+        return false;
+    }
+    llama_synchronize(ctx_tgt);
+
+    if (timing) {
+        timing->logits_decode_ms   = 1e-3 * (ggml_time_us() - t0);
+        timing->features_decode_ms = 0;
+    }
+
+    const int64_t t1 = timing ? ggml_time_us() : 0;
+
+    if (draft_probs != nullptr && !draft_probs->empty()) {
+        std::vector<int> idxs(draft.size() + 1);
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            idxs[i] = (int) i;
+        }
+        out_ids = common_sampler_sample_and_accept_n_dspark(
+                smpl, ctx_tgt, idxs, draft, *draft_probs, temp);
+    } else {
+        out_ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+    }
+
+    if (timing) {
+        timing->accept_ms = 1e-3 * (ggml_time_us() - t1);
+    }
+
+    if (out_ids.empty()) {
+        return false;
+    }
+
+    const int64_t t2 = timing ? ggml_time_us() : 0;
+
+    batch.n_tokens = (int32_t) out_ids.size();
+    if (!common_speculative_process(spec, batch)) {
+        return false;
+    }
+
+    if (timing) {
+        timing->process_ms = 1e-3 * (ggml_time_us() - t2);
+    }
+
+    return true;
+}
+
+// Sequential early-exit target verify: one token per decode, stop at first draft mismatch.
+// Avoids running the full draft block through the target when the prefix is rejected early.
+// Layer-input features stay enabled; process() runs incrementally per committed token.
+bool common_speculative_dspark_verify_sequential(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        llama_batch & batch) {
+    out_ids.clear();
+
+    if (spec == nullptr || smpl == nullptr || ctx_tgt == nullptr) {
+        return false;
+    }
+
+    const bool pure_greedy = common_sampler_is_pure_greedy(smpl);
+
+    auto sample_one = [&](int idx) -> llama_token {
+        if (pure_greedy) {
+            const llama_model * model = llama_get_model(ctx_tgt);
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+            const float * logits = llama_get_logits_ith_no_sync(ctx_tgt, idx);
+            GGML_ASSERT(logits);
+            return common_sampler_greedy_argmax(logits, n_vocab);
+        }
+        return common_sampler_sample_after_sync(smpl, ctx_tgt, idx, false);
+    };
+
+    llama_synchronize(ctx_tgt);
+
+    for (size_t i = 0; i <= draft.size(); ++i) {
+        const llama_token tok_in = (i == 0) ? anchor : draft[i - 1];
+
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_in, pos_verify + (llama_pos) i, { seq_id }, true);
+
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            return false;
+        }
+        llama_synchronize(ctx_tgt);
+
+        const llama_token id = sample_one(0);
+        common_sampler_accept(smpl, id, true);
+        out_ids.push_back(id);
+
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
+
+        if (i < draft.size()) {
+            if (id != draft[i]) {
+                break;
+            }
+        }
+    }
+
+    return true;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

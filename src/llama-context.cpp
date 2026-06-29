@@ -3666,6 +3666,10 @@ float * llama_get_logits(llama_context * ctx) {
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
+    return llama_get_logits_ith_no_sync(ctx, i);
+}
+
+float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
     float * res = nullptr;
 
     res = ctx->get_sampled_logits_ith(i);

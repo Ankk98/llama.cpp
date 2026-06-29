@@ -145,29 +145,19 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
-        for (size_t i = 0; i < draft.size(); ++i) {
-            common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { 0 }, true);
+        const llama_pos pos_verify = n_past;
+        llama_tokens ids;
+        if (!common_speculative_dspark_verify_batched(
+                spec, smpl.get(), ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt,
+                nullptr, &draft_probs, params.sampling.temp)) {
+            return 1;
         }
-        llama_decode(ctx_tgt, batch_tgt);
-
-        std::vector<int> idxs(draft.size() + 1);
-        for (size_t i = 0; i < idxs.size(); ++i) {
-            idxs[i] = (int) i;
-        }
-        auto ids = common_sampler_sample_and_accept_n_dspark(
-                smpl.get(), ctx_tgt, idxs, draft, draft_probs, params.sampling.temp);
-
-        llama_batch proc = batch_tgt;
-        proc.n_tokens = (int32_t) ids.size();
-        common_speculative_process(spec, proc);
 
         accept_sum += (int) ids.size() - 1;
         steps++;
 
         common_speculative_accept(spec, 0, (uint16_t) (ids.size() - 1));
-        n_past += (int) ids.size() - 1;
+        n_past = pos_verify + (int) ids.size();
         for (auto t : ids) {
             prompt_tgt.push_back(id_last);
             id_last = t;

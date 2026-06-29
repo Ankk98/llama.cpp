@@ -147,8 +147,6 @@ int main(int argc, char ** argv) {
         common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, false);
     }
     llama_decode(ctx_tgt, prefill);
-    // process() fully prepares ctx_dft (encode + KV injection); decoding the raw prompt
-    // tokens on ctx_dft again double-injects those positions and corrupts the draft cache
     common_speculative_process(spec, prefill);
 
     common_speculative_begin(spec, 0, prompt_tgt);
@@ -183,32 +181,23 @@ int main(int argc, char ** argv) {
             }
         }
 
-        common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, id_last, n_past++, { seq_id }, true);
-        for (size_t i = 0; i < draft.size(); ++i) {
-            common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { seq_id }, true);
-        }
-        llama_decode(ctx_tgt, batch_tgt);
-
+        const llama_pos pos_verify = n_past;
         std::vector<llama_token> ids;
         if (!draft_probs.empty()) {
-            std::vector<int> idxs(draft.size() + 1);
-            for (size_t i = 0; i < idxs.size(); ++i) {
-                idxs[i] = (int) i;
+            if (!common_speculative_dspark_verify_batched(
+                    spec, smpl.get(), ctx_tgt, seq_id, pos_verify, id_last, draft, ids, batch_tgt,
+                    nullptr, &draft_probs, params.sampling.temp)) {
+                return 1;
             }
-            ids = common_sampler_sample_and_accept_n_dspark(
-                    smpl.get(), ctx_tgt, idxs, draft, draft_probs, params.sampling.temp);
-        } else {
-            ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        } else if (!common_speculative_dspark_verify_batched(
+                spec, smpl.get(), ctx_tgt, seq_id, pos_verify, id_last, draft, ids, batch_tgt)) {
+            fprintf(stderr, "error: dspark batched verify failed\n");
+            return 1;
         }
-
-        llama_batch proc = batch_tgt;
-        proc.n_tokens = (int32_t) ids.size();
-        common_speculative_process(spec, proc);
 
         common_speculative_accept(spec, seq_id, (uint16_t) (ids.size() - 1));
 
-        n_past += (int) ids.size() - 1;
+        n_past = pos_verify + (int) ids.size();
         for (size_t i = 0; i < ids.size(); ++i) {
             prompt_tgt.push_back(id_last);
             id_last = ids[i];
