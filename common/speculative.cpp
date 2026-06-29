@@ -1599,33 +1599,59 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             llama_token prev_token = dp.id_last;
 
+            const bool  use_markov = !disable_markov && dspark_w.markov_rank > 0;
+            const float softcap    = dspark_w.logit_softcap;
+
             for (int32_t i = 0; i < block_size; ++i) {
                 const float * raw_logits = llama_get_logits_ith(ctx_dft, beg + i);
                 GGML_ASSERT(raw_logits);
-                std::memcpy(logits_buf.data(), raw_logits, (size_t) n_vocab * sizeof(float));
 
-                dspark_apply_softcap(logits_buf.data(), n_vocab, dspark_w.logit_softcap);
-
-                if (!disable_markov && dspark_w.markov_rank > 0) {
+                // markov bias is autoregressive (depends on the previous sampled token), so the
+                // per-position chain cannot be batched; the heavy matvec runs on the GPU/backend
+                if (use_markov) {
                     dspark_markov_latent(dspark_w, prev_token, markov_latent.data());
-                    // heavy markov_w2 @ latent matvec runs on the GPU/backend when available
                     if (markov_gpu == nullptr ||
                         !llama_dspark_markov_gpu_bias(markov_gpu, prev_token, markov_bias.data())) {
                         dspark_markov_bias(dspark_w, markov_latent.data(), markov_bias.data());
                     }
+                }
+
+                llama_token id;
+                if (temperature < 1e-5f && !dp.draft_probs) {
+                    // greedy fast path: fuse softcap + bias into a single argmax pass, skipping the
+                    // probs vector, exp normalization and per-position discrete_distribution build
+                    int   best     = 0;
+                    float best_val = -INFINITY;
                     for (int v = 0; v < n_vocab; ++v) {
-                        logits_buf[v] += markov_bias[v];
+                        float l = softcap > 0.0f ? softcap * tanhf(raw_logits[v] / softcap) : raw_logits[v];
+                        if (use_markov) {
+                            l += markov_bias[v];
+                        }
+                        if (l > best_val) {
+                            best_val = l;
+                            best     = v;
+                        }
                     }
+                    id = (llama_token) best;
+                } else {
+                    std::memcpy(logits_buf.data(), raw_logits, (size_t) n_vocab * sizeof(float));
+                    dspark_apply_softcap(logits_buf.data(), n_vocab, softcap);
+                    if (use_markov) {
+                        for (int v = 0; v < n_vocab; ++v) {
+                            logits_buf[v] += markov_bias[v];
+                        }
+                    }
+
+                    std::vector<float> probs;
+                    dspark_logits_to_probs(logits_buf.data(), n_vocab, temperature, probs);
+
+                    if (dp.draft_probs) {
+                        dp.draft_probs->push_back(probs);
+                    }
+
+                    id = dspark_sample_from_probs(probs, rngs[seq_id]);
                 }
 
-                std::vector<float> probs;
-                dspark_logits_to_probs(logits_buf.data(), n_vocab, temperature, probs);
-
-                if (dp.draft_probs) {
-                    dp.draft_probs->push_back(probs);
-                }
-
-                const llama_token id = dspark_sample_from_probs(probs, rngs[seq_id]);
                 sampled.push_back(id);
                 prev_token = id;
 
