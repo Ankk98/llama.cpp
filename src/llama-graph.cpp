@@ -917,6 +917,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_argmax_out.clear();
 
     params = {};
 
@@ -3059,13 +3060,24 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    int32_t n_output_rows = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.output[i]) {
+            n_output_rows++;
+        }
+    }
+
+    // DSpark verify: fuse per-row argmax when skipping host logits on multi-row batches
+    const bool fuse_verify_argmax = res->t_logits && n_output_rows > 1 && cparams.skip_host_logits;
+
+    if ((samplers.empty() && !fuse_verify_argmax) || !res->t_logits) {
         return;
     }
 
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
+    if (!samplers.empty()) {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
@@ -3144,6 +3156,34 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+
+    } // !samplers.empty()
+
+    // DSpark verify: fuse one argmax node per output row into the same graph submit
+    if (fuse_verify_argmax) {
+        res->t_argmax_out.clear();
+
+        ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+
+        int32_t row_idx = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (!ubatch.output[i]) {
+                continue;
+            }
+
+            ggml_tensor * logits_row = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], (size_t) row_idx * logits_t->nb[1]);
+            ggml_format_name(logits_row, "verify_logits_row_%d", row_idx);
+
+            ggml_tensor * tok = ggml_argmax(ctx0, logits_row);
+            ggml_format_name(tok, "verify_argmax_%d", row_idx);
+            ggml_set_output(tok);
+
+            ggml_build_forward_expand(gf, tok);
+            res->t_argmax_out.push_back(tok);
+
+            row_idx++;
+        }
+    }
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

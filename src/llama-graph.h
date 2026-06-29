@@ -692,6 +692,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.skip_host_logits        == other.cparams.skip_host_logits        &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -749,6 +750,9 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+
+    // per output row (batch order), when cparams.verify_argmax_all_rows is set
+    std::vector<ggml_tensor *> t_argmax_out;
 
     std::vector<llm_graph_input_ptr> inputs;
 

@@ -94,6 +94,13 @@ std::vector<llama_token> common_sampler_greedy_accept_n_gpu(
         const std::vector<int>  & idxs,
         const llama_tokens      & draft);
 
+// Fused per-row argmax from the verify forward graph (default greedy verify path).
+std::vector<llama_token> common_sampler_greedy_accept_n_fused(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft);
+
 llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab);
 
 llama_token common_sampler_sample_after_sync(

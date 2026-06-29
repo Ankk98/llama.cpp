@@ -5,6 +5,8 @@
 #include "log.h"
 #include "llama.h"
 
+#include "../src/llama-ext.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -154,6 +156,13 @@ static int run_speculative(
     common_sampler_accept(smpl, id_last, true);
     out->pp_ms = now_ms() - tpp;
 
+    // fused verify skips full-vocab logits D2H; enable after prefill first sample
+    const bool fused_verify = getenv("DSPARK_FUSED_ARGMAX") != nullptr
+            && getenv("DSPARK_GPU_GREEDY") == nullptr;
+    if (fused_verify) {
+        llama_set_skip_host_logits(ctx_tgt, true);
+    }
+
     out->output = inp;
     out->output.push_back(id_last);
     out->n_generated++;
@@ -176,10 +185,6 @@ static int run_speculative(
 
         out->n_propose_steps++;
         out->n_drafted += (int) draft.size();
-
-        if (draft.empty()) {
-            break;
-        }
 
         const llama_pos pos_verify = n_past;
         llama_tokens ids;

@@ -120,8 +120,9 @@ LLAMA_API float * llama_get_embeddings_layer_inp_no_sync(struct llama_context * 
 LLAMA_API void llama_set_defer_layer_inp_extract(struct llama_context * ctx, bool value);
 LLAMA_API bool llama_commit_layer_inputs(struct llama_context * ctx, size_t n_tokens);
 
-// Skip full-vocab logits D2H during decode; use with llama_greedy_verify_accept().
+// Skip full-vocab logits D2H during multi-row decode (use llama_get_verify_argmax_ith).
 LLAMA_API void llama_set_skip_host_logits(struct llama_context * ctx, bool value);
+LLAMA_API llama_token llama_get_verify_argmax_ith(struct llama_context * ctx, int32_t i);
 
 // Greedy argmax on GPU logits rows (batch_idxs length = n_draft + 1). temp=0 only.
 LLAMA_API bool llama_greedy_verify_accept(

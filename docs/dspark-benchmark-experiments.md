@@ -26,12 +26,16 @@ inflated speedup by ~10-15% (e.g. 1.77x reported vs **1.57-1.61x fair**).
 
 ### Standard command
 
+Use **`-c 512`** for this workload (~92-token prompt). `-c 1024` allocates 2x KV for
+both target and draft and slows verify ~35% with no benefit here. **Never omit `-c`**:
+default `n_ctx=0` loads the model's trained context (262144 for Gemma4) and OOMs.
+
 ```bash
 DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   -m "$TARGET" -md "$DRAFT" \
   --input-ids /tmp/dspark_eval/code_500l.json \
   --spec-type draft-dspark \
-  -c 1024 -ngl 99 -ngld 99 --temp 0 --seed 42 \
+  -c 512 -ngl 99 -ngld 99 --temp 0 --seed 42 \
   --spec-draft-n-max 4 -n 400
 ```
 
@@ -45,7 +49,24 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
 | `DSPARK_SPLIT_VERIFY=1` | Dual ctx verify (structurally slower; see below) |
 | `DSPARK_GPU_GREEDY=1` | Opt-in GPU argmax accept (experimental; default off) |
 | `DSPARK_NO_GPU_GREEDY=1` | Force CPU greedy accept (default path) |
+| `DSPARK_FUSED_ARGMAX=1` | In-graph per-row argmax (experimental; match NO on Vulkan) |
+| `DSPARK_VERIFY_SEQ=1` | Sequential early-exit verify (slower, match NO) |
 | `DSPARK_NO_DEFER_LAYER_INP=1` | Full layer D2H on every verify row (slower) |
+
+### Safe profiling (avoid OOM)
+
+| Do | Don't |
+|----|-------|
+| `-c 512`, `-n 20` for quick checks | `GGML_VK_PERF_LOGGER=1` on full `compare_vanilla_speculative` (dual model + vanilla+spec) |
+| `llama-bench -d 512 -p 5` for isolated 5-token forward | `-c 0` or omit `-c` on harnesses without the 512 default guard |
+| `DSPARK_BENCH_NO_COOLDOWN=1` for iteration | `-c 1024` unless you need long context |
+
+Isolated Vulkan forward (single model):
+
+```bash
+./build/bin/llama-bench -m "$TARGET" -ngl 99 -fa off -d 512 -p 5 -r 3
+GGML_VK_PERF_LOGGER=1 ./build/bin/llama-bench -m "$TARGET" -ngl 99 -fa off -d 512 -p 5 -r 1 --no-warmup
+```
 
 ### Reading pp vs tgp
 
@@ -78,23 +99,60 @@ Spec pp is not comparable to vanilla pp (extra setup). **tgp speedup is the head
 | Split verify (dual ctx) | **0.79-1.04x** | 2nd target forward >> layer-tap savings |
 | flash-attn on/off | **neutral** | ~1.5-1.7x within variance |
 | ubatch 256-2048 | **neutral** | Within variance |
-| `-c 512` vs `1024` | **neutral** | Within variance |
+| `-c 512` vs `1024` | **real** | Same prompt: verify 69 vs 92 ms; **1.57x vs 1.19x** speedup |
 | `n_max=7` on coding | **0.96x, match NO** | Quality drift |
 
-### Bottleneck (honest, measured 2026-06-29)
+### DeepSpec reference alignment (2026-06-29)
 
-Per verify step (n_max=4, fair, defer layer on):
+Compared against `~/repos/DeepSpec` (`draft_ops.py`, `base_evaluator.py`, Gemma4 config).
+
+| Topic | DeepSpec | llama.cpp | OK? |
+|-------|----------|-----------|-----|
+| Confidence at default | `threshold=0` -> full block, head unused | Same (`use_confidence` only if `threshold > 0`) | **YES** |
+| Confidence features | `concat(hidden, markov_w1(prev))` | `dspark_confidence_logit()` same layout | **YES** |
+| Truncation | first `sigmoid(conf) < threshold` | `dspark_confident_prefix_length()` | **YES** |
+| Markov + softcap | autoregressive `w2(w1(prev))` + tanh softcap | CPU/GPU paths match | **YES** |
+| Verify | single batched target forward + rejection | `verify_batched()` + greedy at temp=0 | **YES** |
+| `block_size` / n_max | always 7 at eval | default `n_max=4`, adaptive optional | **diff** (perf tuning) |
+| Draft forward | full `block_size` tokens | `n_draft+1` when confidence off | **diff** (optimization) |
+| Target dtype | bf16 eval | Q4 GGUF | **diff** (acceptance drift) |
+
+Confidence head weights are in the draft GGUF (`enable_confidence_head=true`,
+`confidence_head_with_markov=true`). We are **not** misusing it; at threshold 0 it is
+correctly skipped (same as DeepSpec eval defaults).
+
+### Bottleneck (measured 2026-06-29, `-c 512 -d 512`)
+
+**Vulkan isolated target forward** (`llama-bench`, flash-attn off, Strix Halo):
+
+| Test | ms | Notes |
+|------|-----|-------|
+| 1-token TG @ d512 | **~43** | 23 tok/s |
+| 5-token PP @ d512 (batched) | **~70** | 71 tok/s for 5 tokens |
+| 5x1-token TG @ d512 (sequential) | **~212** | 23 tok/s x 5 |
+
+Batched 5-token is **~3x** faster than 5 sequential singles (attention/matmul reuse).
+
+**Single 5-token graph VK breakdown** (~70 ms GPU, no layer taps):
+
+| Component | ms | Share |
+|-----------|-----|-------|
+| Q4 `MUL_MAT_VEC` (layers) | ~46 | 66% |
+| LM head (`q6_K` vocab) | ~4 | 5% |
+| RMS/ROPE/norm | ~4 | 5% |
+| Other | ~16 | 23% |
+
+**DSpark verify step** (`n_max=4`, defer layer on, `-c 512`):
 
 | Phase | ms/step | Notes |
 |-------|---------|-------|
 | decode submit (async return) | ~3 | `llama_decode` returns before GPU done |
-| **GPU forward + logits fence** | **~60** | Dominates verify; labeled "accept" in harness |
-| layer commit (partial D2H) | ~0.2 | Deferred path only |
+| **GPU forward + logits fence** | **~65** | Dominates; labeled "accept" in harness |
+| layer commit (partial D2H) | ~0.2 | Deferred path |
 | process (encode + inject) | ~1.3 | Not the limiter |
 | draft step | ~18 | Separate from verify |
 
-**The ~60 ms is 12B Q4 batched forward on 5 tokens**, not CPU argmax or layer D2H.
-Vanilla 1-token forward is ~38 ms. Batching 5 tokens costs ~1.6x not 5x (good).
+At `-c 1024`, verify rises to **~92 ms** (longer KV attention) with no gain for this prompt.
 
 **2-3x coding target math (from ~1.62x fair):**
 
@@ -108,13 +166,16 @@ and/or **higher acceptance without quality loss**.
 
 ## Fair throughput results
 
-All: `-c 1024`, `temp=0`, `seed=42`, vanilla-first + 3s cooldown, `DSPARK_NO_ADAPTIVE_NMAX=1`.
+Default fair settings: `-c 512`, `temp=0`, `seed=42`, vanilla-first + 3s cooldown,
+`DSPARK_NO_ADAPTIVE_NMAX=1`.
 
 ### Coding (`code_500l`, n_predict=400)
 
 | Config | tgp van | tgp spec | **Speedup** | Accept/step | Verify ms | Match |
 |--------|---------|----------|-------------|-------------|-----------|-------|
-| **defer layer (default)** | ~26.1 | **~42.2** | **1.62x** | 2.50 | ~64 | **YES** |
+| **defer layer, `-c 512`** | 25.1 | **39.5** | **1.57x** | 2.50 | 69 | **YES** |
+| defer layer, `-c 1024` | 25.0 | 29.6 | 1.19x | 2.50 | 92 | YES |
+| defer layer (earlier, c1024) | ~26.1 | ~42.2 | 1.62x | 2.50 | ~64 | YES |
 | no defer layer | ~26.0 | ~26.5 | 1.02x | 2.50 | ~201 | YES |
 | adaptive n_max | ~26.1 | ~39.4 | 1.51x | 2.50 | ~69 | YES |
 | GPU greedy (broken) | ~26.0 | ~35.5 | 1.37x | 3.89* | ~236 | NO |
@@ -136,7 +197,7 @@ Agentic acceptance ~1.3-1.6/step limits speedup. **1.5x fair target not met** (~
 
 | Workload | Target | Fair best | Gap to 2x | Gap to 3x |
 |----------|--------|-----------|-----------|-----------|
-| Coding | 2-3x | **1.62x** | 24% | 85% |
+| Coding | 2-3x | **1.57x** (`-c 512`) | 27% | 91% |
 | Agentic | 1.5x | 1.40x | n/a | n/a |
 
 ## Experiment log
@@ -145,7 +206,54 @@ Agentic acceptance ~1.3-1.6/step limits speedup. **1.5x fair target not met** (~
 |------|--------|--------|---------------------|
 | 2026-06-29 | 843457e | Fair harness (vanilla-first + cooldown) | 1.61x |
 | 2026-06-29 | f360dae | GPU greedy + defer layer + warmup (defer buggy) | regressed |
-| 2026-06-29 | (pending) | Fix defer sync; timing; GPU greedy opt-in | **1.62x** |
+| 2026-06-29 | 33fc593 | Fix defer sync; timing; GPU greedy opt-in | **1.62x** |
+| 2026-06-29 | (wip) | Defer cleanup fix; DeepSpec audit; VK profile; `-c 512` | **1.57x** |
+
+### 2026-06-29 session: 3x attempts + profiling
+
+| Experiment | tgp speedup | Accept/step | Match | Notes |
+|------------|-------------|-------------|-------|-------|
+| CPU greedy, `-c 512`, n=400 | **1.57x** | 2.50 | YES | verify ~69ms; recommended fair config |
+| CPU greedy, `-c 1024`, n=400 | 1.19x | 2.50 | YES | verify ~92ms; extra KV hurts |
+| `DSPARK_FUSED_ARGMAX=1` | 0.44x | 0.98 | NO | in-graph argmax wrong tokens on Vulkan |
+| `DSPARK_VERIFY_SEQ=1` | 0.88x | 2.50 | NO | 1 decode/token >> batched savings |
+| `GGML_VK_PERF_LOGGER` on compare | OOM | - | - | dual model + logger; do not use |
+
+**3x conclusion:** batched verify GPU graph is ~70ms (66% matmul). Need ~40ms graph AND/OR
+~3.5 accept/step. Fused argmax saves little vs forward. Use `-c 512` not 1024 for coding bench.
+
+### 2026-06-29: confidence scheduling sweep
+
+**Why not tried earlier:** default `--dspark-confidence-threshold 0` disables truncation
+(same as DeepSpec eval). Work focused on the fast path with `n_max=4` and a short draft forward
+(anchor + 4 masks, not full `block_size=7`). Mid-threshold sweeps also hit a defer-layer commit
+bug (`extract_layer_inputs` assumed commit rows == tensor rows) - fixed in this session.
+
+Config: `code_500l`, `-c 512`, `-n 400`, `n_max=4`, `DSPARK_NO_ADAPTIVE_NMAX=1`, temp=0, seed=42.
+
+| Threshold | tgp speedup | Accept/step | Draft ms | Verify ms | Proposes | Match vanilla |
+|-----------|-------------|-------------|----------|-----------|----------|---------------|
+| **0.0** (off) | **1.66x** | 2.50 | 19 | 63 | 4 | YES |
+| 0.3 | 0.98x | 3.04 | 62 | 99 | 6 | NO |
+| 0.5 | 1.08x | 3.02 | 62 | 87 | 5 | NO |
+| 0.7 | 1.04x | 2.77 | 69 | 76 | 4 | NO |
+| 0.8 | 0.98x | 2.36 | 68 | 69 | 3 | NO |
+| 0.9 | 0.98x | 2.09 | 66 | 63 | 2 | NO |
+
+**Takeaway:** confidence on forces a full `block_size=7` draft forward (~3x draft cost). Higher
+accept/step does not compensate on Q4 Vulkan. Verify ms drops slightly at high thresholds (shorter
+proposals) but net tgp regresses to ~1.0x. Threshold 0 remains best for throughput; scheduling
+may help bf16 setups where draft cost is lower relative to verify.
+
+```bash
+# confidence sweep example
+for T in 0.0 0.5 0.7 0.9; do
+  DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
+    -m "$TARGET" -md "$DRAFT" --input-ids /tmp/dspark_eval/code_500l.json \
+    --spec-type draft-dspark -c 512 -ngl 99 -ngld 99 --temp 0 --seed 42 \
+    --spec-draft-n-max 4 --dspark-confidence-threshold $T -n 400
+done
+```
 
 ## Open work (structural, ordered by impact)
 
@@ -160,7 +268,7 @@ Agentic acceptance ~1.3-1.6/step limits speedup. **1.5x fair target not met** (~
 COMM=$(git rev-parse --short HEAD)
 DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   -m "$TARGET" -md "$DRAFT" --input-ids /tmp/dspark_eval/code_500l.json \
-  --spec-type draft-dspark -c 1024 -ngl 99 -ngld 99 --temp 0 --seed 42 \
+  --spec-type draft-dspark -c 512 -ngl 99 -ngld 99 --temp 0 --seed 42 \
   --spec-draft-n-max 4 -n 400 2>&1 | tee /tmp/bench.out
 
 grep -E 'generated:|throughput|tgp speedup|mean accepted|token match|verify step|accept \(GPU|layer commit' /tmp/bench.out

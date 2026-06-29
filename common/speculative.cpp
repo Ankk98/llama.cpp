@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <unordered_set>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1229,6 +1230,32 @@ static void dspark_warmup_verify_graph(llama_context * ctx, int32_t n_max, llama
     llama_synchronize(ctx);
     llama_batch_free(warm);
     llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 0, -1);
+}
+
+static void dspark_ensure_fused_verify_graph(llama_context * ctx, int32_t n_verify, llama_seq_id seq_id) {
+    if (ctx == nullptr || n_verify <= 1) {
+        return;
+    }
+
+    static std::unordered_set<llama_context *> enabled;
+    if (enabled.count(ctx)) {
+        return;
+    }
+
+    llama_set_skip_host_logits(ctx, true);
+    llama_graph_reserve(ctx, (uint32_t) n_verify, 1, (uint32_t) n_verify);
+
+    llama_batch warm = llama_batch_init(llama_n_batch(ctx), 0, 1);
+    for (int32_t i = 0; i < n_verify; ++i) {
+        common_batch_add(warm, 0, (llama_pos) i, { seq_id }, true);
+    }
+
+    llama_decode(ctx, warm);
+    llama_synchronize(ctx);
+    llama_batch_free(warm);
+    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 0, -1);
+
+    enabled.insert(ctx);
 }
 
 static void dspark_markov_latent(const llama_dspark_spec_cpu & w, llama_token tok, float * out) {
@@ -3313,28 +3340,43 @@ bool common_speculative_dspark_verify_batched(
 
     const int64_t t0 = timing ? ggml_time_us() : 0;
 
-    const bool gpu_greedy = draft_probs == nullptr
+    const bool pure_greedy = draft_probs == nullptr
             && (temp == 0.0f || temp == -1.0f)
-            && common_sampler_is_pure_greedy(smpl)
+            && common_sampler_is_pure_greedy(smpl);
+
+    const bool fused_argmax = pure_greedy && getenv("DSPARK_FUSED_ARGMAX") != nullptr;
+
+    const bool gpu_greedy = pure_greedy
+            && !fused_argmax
             && getenv("DSPARK_GPU_GREEDY") != nullptr
             && getenv("DSPARK_NO_GPU_GREEDY") == nullptr;
 
-    const bool defer_layers = !split_verify && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
+    const bool logits_only = !split_verify && getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
+    const bool defer_layers = !split_verify && !logits_only && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
 
-    if (gpu_greedy) {
-        llama_set_skip_host_logits(ctx_tgt, true);
+    if (fused_argmax) {
+        dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, seq_id);
     }
+
+    if (logits_only) {
+        common_speculative_dspark_target_features_enable(spec, false);
+    }
+
     if (defer_layers) {
         llama_set_defer_layer_inp_extract(ctx_tgt, true);
     }
 
-    if (llama_decode(ctx_tgt, batch) != 0) {
-        if (gpu_greedy) {
-            llama_set_skip_host_logits(ctx_tgt, false);
+    auto cleanup_verify_flags = [&]() {
+        if (logits_only) {
+            common_speculative_dspark_target_features_enable(spec, true);
         }
+    };
+
+    if (llama_decode(ctx_tgt, batch) != 0) {
         if (defer_layers) {
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
+        cleanup_verify_flags();
         return false;
     }
 
@@ -3353,13 +3395,18 @@ bool common_speculative_dspark_verify_batched(
         }
         out_ids = common_sampler_sample_and_accept_n_dspark(
                 smpl, ctx_tgt, idxs, draft, *draft_probs, temp);
+    } else if (fused_argmax) {
+        std::vector<int> idxs(draft.size() + 1);
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            idxs[i] = (int) i;
+        }
+        out_ids = common_sampler_greedy_accept_n_fused(smpl, ctx_tgt, idxs, draft);
     } else if (gpu_greedy) {
         std::vector<int> idxs(draft.size() + 1);
         for (size_t i = 0; i < idxs.size(); ++i) {
             idxs[i] = (int) i;
         }
         out_ids = common_sampler_greedy_accept_n_gpu(smpl, ctx_tgt, idxs, draft);
-        llama_set_skip_host_logits(ctx_tgt, false);
     } else {
         out_ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
     }
@@ -3368,7 +3415,6 @@ bool common_speculative_dspark_verify_batched(
         const int64_t t1_end = ggml_time_us();
         timing->decode_submit_ms   = 1e-3 * (t_decode - t0);
         timing->accept_ms          = 1e-3 * (t1_end - t1);
-        // GPU forward completion + logits D2H fence (decode returns before GPU done)
         timing->logits_decode_ms   = 1e-3 * (t_decode - t0);
     }
 
@@ -3379,6 +3425,8 @@ bool common_speculative_dspark_verify_batched(
         llama_set_defer_layer_inp_extract(ctx_tgt, false);
     }
 
+    cleanup_verify_flags();
+
     if (timing && defer_layers) {
         timing->layer_commit_ms = 1e-3 * (ggml_time_us() - t_commit);
     } else if (timing) {
@@ -3387,6 +3435,33 @@ bool common_speculative_dspark_verify_batched(
 
     if (out_ids.empty()) {
         return false;
+    }
+
+    if (logits_only) {
+        const int64_t t_feat = timing ? ggml_time_us() : 0;
+
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
+
+        common_speculative_dspark_target_features_enable(spec, true);
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            return false;
+        }
+        llama_synchronize(ctx_tgt);
+
+        if (timing) {
+            timing->features_decode_ms = 1e-3 * (ggml_time_us() - t_feat);
+        }
+
+        batch.n_tokens = (int32_t) out_ids.size();
+        const int64_t t3 = timing ? ggml_time_us() : 0;
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
+        if (timing) {
+            timing->process_ms = 1e-3 * (ggml_time_us() - t3);
+        }
+        return true;
     }
 
     const int64_t t2 = timing ? ggml_time_us() : 0;

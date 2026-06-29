@@ -93,6 +93,8 @@ struct llama_context {
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
+    llama_token get_verify_argmax_ith(int32_t i);
+
     float * get_sampled_logits_ith(int32_t idx);
     size_t  get_sampled_logits_count(int32_t idx);
 
@@ -242,10 +244,11 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tensor_rows, size_t n_commit_rows = 0);
 
-    const llm_graph_result * defer_layer_res         = nullptr;
-    size_t                   defer_layer_token_offset = 0;
+    const llm_graph_result * defer_layer_res          = nullptr;
+    size_t                   defer_layer_token_offset  = 0;
+    size_t                   defer_layer_n_tokens      = 0;
 
     //
     // graph
@@ -331,6 +334,9 @@ private:
     };
 
     sampling_info sampling;
+
+    // fused per-row verify argmax (int32 on host, async D2H from graph)
+    std::vector<llama_token> verify_argmax;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

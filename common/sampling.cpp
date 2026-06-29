@@ -742,6 +742,46 @@ std::vector<llama_token> common_sampler_greedy_accept_n_gpu(
     return result;
 }
 
+std::vector<llama_token> common_sampler_greedy_accept_n_fused(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    llama_synchronize(ctx);
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = llama_get_verify_argmax_ith(ctx, idxs[i]);
+        if (id == LLAMA_TOKEN_NULL) {
+            return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false);
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = llama_get_verify_argmax_ith(ctx, idxs[i]);
+        if (id == LLAMA_TOKEN_NULL) {
+            return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false);
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 llama_token common_sampler_sample_after_sync(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
