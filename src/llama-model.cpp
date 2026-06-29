@@ -293,6 +293,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_DSPARK:
+            return new llama_model_dspark(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -2497,6 +2499,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2621,7 +2624,8 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:    return true;
         default:                 return false;
     }
 }
@@ -2715,4 +2719,62 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+static bool llama_dspark_tensor_copy_f32(const ggml_tensor * t, std::vector<float> & out) {
+    if (t == nullptr) {
+        return false;
+    }
+
+    const size_t n = ggml_nelements(t);
+    out.resize(n);
+    ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+    return true;
+}
+
+bool llama_dspark_spec_cpu_init(const struct llama_model * model, llama_dspark_spec_cpu * out) {
+    if (model == nullptr || out == nullptr) {
+        return false;
+    }
+
+    if (model->arch != LLM_ARCH_DSPARK) {
+        return false;
+    }
+
+    out->block_size                  = model->hparams.dspark_block_size;
+    out->markov_rank                 = model->hparams.markov_rank;
+    out->n_embd                      = (int32_t) model->hparams.n_embd;
+    out->logit_softcap               = model->hparams.f_final_logit_softcapping;
+    out->enable_confidence_head      = model->hparams.enable_confidence_head;
+    out->confidence_head_with_markov = model->hparams.confidence_head_with_markov;
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    out->n_vocab = llama_vocab_n_tokens(vocab);
+
+    out->markov_w1.clear();
+    out->markov_w2.clear();
+    out->confidence_proj_w.clear();
+    out->confidence_proj_b = 0.0f;
+
+    if (out->markov_rank > 0) {
+        if (!llama_dspark_tensor_copy_f32(model->markov_w1, out->markov_w1) ||
+            !llama_dspark_tensor_copy_f32(model->markov_w2, out->markov_w2)) {
+            return false;
+        }
+    }
+
+    if (out->enable_confidence_head) {
+        if (!llama_dspark_tensor_copy_f32(model->confidence_proj, out->confidence_proj_w)) {
+            return false;
+        }
+        if (model->confidence_proj_b) {
+            std::vector<float> bias;
+            if (!llama_dspark_tensor_copy_f32(model->confidence_proj_b, bias) || bias.empty()) {
+                return false;
+            }
+            out->confidence_proj_b = bias[0];
+        }
+    }
+
+    return true;
 }

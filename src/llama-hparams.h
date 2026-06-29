@@ -243,6 +243,12 @@ struct llama_hparams {
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
 
+    // dspark speculative draft
+    uint32_t dspark_block_size = 0;
+    uint32_t markov_rank = 0;
+    bool enable_confidence_head = false;
+    bool confidence_head_with_markov = false;
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;

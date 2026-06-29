@@ -158,6 +158,10 @@ class Keys:
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
         BLOCK_SIZE                        = "{arch}.block_size"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
+        MARKOV_RANK                       = "{arch}.markov_rank"
+        MARKOV_HEAD_TYPE                  = "{arch}.markov_head_type"
+        ENABLE_CONFIDENCE_HEAD            = "{arch}.enable_confidence_head"
+        CONFIDENCE_HEAD_WITH_MARKOV       = "{arch}.confidence_head_with_markov"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -519,6 +523,7 @@ class MODEL_ARCH(IntEnum):
     MISTRAL3         = auto()
     EAGLE3           = auto()
     DFLASH           = auto()
+    DSPARK           = auto()
     MISTRAL4         = auto()
     PADDLEOCR        = auto()
     MIMO2            = auto()
@@ -920,6 +925,9 @@ class MODEL_TENSOR(IntEnum):
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
+    MARKOV_W1              = auto()  # dspark
+    MARKOV_W2              = auto()  # dspark
+    CONFIDENCE_PROJ        = auto()  # dspark
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1077,6 +1085,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.EAGLE3:           "eagle3",
     MODEL_ARCH.DFLASH:           "dflash",
+    MODEL_ARCH.DSPARK:           "dspark",
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
     MODEL_ARCH.MIMO2:            "mimo2",
@@ -1504,6 +1513,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.D2T:                       "d2t",
+    MODEL_TENSOR.MARKOV_W1:                 "markov.w1",
+    MODEL_TENSOR.MARKOV_W2:                 "markov.w2",
+    MODEL_TENSOR.CONFIDENCE_PROJ:           "confidence.proj",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -4104,6 +4116,30 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.ENC_OUTPUT_NORM,
+    ],
+    MODEL_ARCH.DSPARK: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
+        MODEL_TENSOR.FC,
+        MODEL_TENSOR.ENC_OUTPUT_NORM,
+        MODEL_TENSOR.MARKOV_W1,
+        MODEL_TENSOR.MARKOV_W2,
+        MODEL_TENSOR.CONFIDENCE_PROJ,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -658,6 +659,122 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+static void common_logits_to_probs(const float * logits, int n_vocab, float temp, std::vector<float> & probs) {
+    probs.assign(n_vocab, 0.0f);
+
+    if (temp < 1e-5f) {
+        int best = 0;
+        for (int i = 1; i < n_vocab; ++i) {
+            if (logits[i] > logits[best]) {
+                best = i;
+            }
+        }
+        probs[best] = 1.0f;
+        return;
+    }
+
+    float max_l = logits[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        max_l = std::max(max_l, logits[i]);
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        probs[i] = std::exp((logits[i] - max_l) / temp);
+        sum += probs[i];
+    }
+
+    const float inv = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+    for (int i = 0; i < n_vocab; ++i) {
+        probs[i] *= inv;
+    }
+}
+
+static llama_token common_sample_from_probs(const std::vector<float> & probs, std::mt19937 & rng) {
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return (llama_token) dist(rng);
+}
+
+static llama_token common_sample_residual(
+        const std::vector<float> & target_probs,
+        const std::vector<float> & draft_probs,
+        std::mt19937 & rng) {
+    GGML_ASSERT(target_probs.size() == draft_probs.size());
+
+    const int n_vocab = (int) target_probs.size();
+    std::vector<float> residual(n_vocab, 0.0f);
+
+    double sum = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        residual[i] = std::max(0.0f, target_probs[i] - draft_probs[i]);
+        sum += residual[i];
+    }
+
+    if (sum <= 1e-8) {
+        return common_sample_from_probs(target_probs, rng);
+    }
+
+    const float inv = (float) (1.0 / sum);
+    for (int i = 0; i < n_vocab; ++i) {
+        residual[i] *= inv;
+    }
+
+    return common_sample_from_probs(residual, rng);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_dspark(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<float>> & draft_probs,
+        float temp,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(draft_probs.size() == draft.size());
+
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::mt19937 rng(common_sampler_get_seed(gsmpl));
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const float * logits = llama_get_logits_ith(ctx, idxs[i]);
+        GGML_ASSERT(logits);
+
+        std::vector<float> target_probs;
+        common_logits_to_probs(logits, n_vocab, temp, target_probs);
+
+        const llama_token prop = draft[i];
+        const float p_t = target_probs[prop];
+        const float p_d = std::max(draft_probs[i][prop], 1e-8f);
+        const float accept_prob = std::min(p_t / p_d, 1.0f);
+
+        if (uni(rng) < accept_prob) {
+            common_sampler_accept(gsmpl, prop, true);
+            result.push_back(prop);
+        } else {
+            const llama_token id = common_sample_residual(target_probs, draft_probs[i], rng);
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

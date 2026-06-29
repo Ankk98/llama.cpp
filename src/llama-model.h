@@ -574,6 +574,12 @@ struct llama_model {
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // dspark (markov/confidence applied in the spec driver, not the graph)
+    struct ggml_tensor * markov_w1         = nullptr;
+    struct ggml_tensor * markov_w2         = nullptr;
+    struct ggml_tensor * confidence_proj   = nullptr;
+    struct ggml_tensor * confidence_proj_b = nullptr;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 

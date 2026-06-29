@@ -946,6 +946,18 @@ class GGUFWriter:
     def add_target_layers(self, value: Sequence[int]) -> None:
         self.add_array(Keys.LLM.TARGET_LAYERS.format(arch=self.arch), value)
 
+    def add_markov_rank(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.MARKOV_RANK.format(arch=self.arch), value)
+
+    def add_markov_head_type(self, value: str) -> None:
+        self.add_string(Keys.LLM.MARKOV_HEAD_TYPE.format(arch=self.arch), value)
+
+    def add_enable_confidence_head(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.ENABLE_CONFIDENCE_HEAD.format(arch=self.arch), value)
+
+    def add_confidence_head_with_markov(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.CONFIDENCE_HEAD_WITH_MARKOV.format(arch=self.arch), value)
+
     def add_target_hidden_size(self, value: int) -> None:
         self.add_uint32(Keys.LLM.TARGET_HIDDEN_SIZE.format(arch=self.arch), value)
 

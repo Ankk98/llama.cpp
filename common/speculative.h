@@ -46,6 +46,9 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional output: per-position draft probability vectors (DSpark, temp > 0)
+    std::vector<std::vector<float>> * draft_probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -64,6 +67,9 @@ bool common_speculative_need_embd_nextn(common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// update runtime DSpark options (temp/seed/confidence) before drafting
+void common_speculative_sync_params(common_speculative * spec, const common_params_speculative & params);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

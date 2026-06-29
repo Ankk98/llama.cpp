@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -124,3 +125,21 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// DSpark speculative driver CPU weights (markov + confidence; copied from draft model at init)
+struct llama_dspark_spec_cpu {
+    uint32_t block_size                 = 0;
+    uint32_t markov_rank                = 0;
+    int32_t  n_vocab                    = 0;
+    int32_t  n_embd                     = 0;
+    float    logit_softcap              = 0.0f; // 0 = disabled
+    bool     enable_confidence_head     = false;
+    bool     confidence_head_with_markov = false;
+
+    std::vector<float> markov_w1;         // ggml layout [markov_rank, n_vocab]
+    std::vector<float> markov_w2;         // ggml layout [markov_rank, n_vocab]
+    std::vector<float> confidence_proj_w; // [conf_in]
+    float              confidence_proj_b = 0.0f;
+};
+
+LLAMA_API bool llama_dspark_spec_cpu_init(const struct llama_model * model, llama_dspark_spec_cpu * out);

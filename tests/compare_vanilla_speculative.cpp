@@ -1,0 +1,355 @@
+#include "arg.h"
+#include "common.h"
+#include "sampling.h"
+#include "speculative.h"
+#include "log.h"
+#include "llama.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+struct run_stats {
+    std::vector<llama_token> output;
+    double pp_ms = 0;
+    double gen_ms = 0;
+    int n_prompt = 0;
+    int n_generated = 0;
+    int n_drafted = 0;
+    int n_accepted = 0;
+    int n_propose_steps = 0;
+};
+
+static void usage(const char * argv0) {
+    fprintf(stderr,
+            "Usage: %s -m TARGET.gguf [-md DRAFT.gguf] --input-ids PATH "
+            "[--temp 0] [--seed 42] [-n 32] [-c 512] [-ngl N] [-ngld N]\n",
+            argv0);
+}
+
+static double now_ms() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(
+            clock::now().time_since_epoch()).count();
+}
+
+static int run_vanilla(
+        common_params & params,
+        llama_context * ctx_tgt,
+        common_sampler * smpl,
+        std::vector<llama_token> & inp,
+        int n_predict,
+        run_stats * out) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+
+    llama_token id_last = inp.back();
+    llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
+    int n_past = (int) inp.size() - 1;
+
+    llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    llama_batch prefill = llama_batch_get_one(inp.data(), (int) inp.size() - 1);
+    out->n_prompt = (int) inp.size() - 1;
+    const double tpp = now_ms();
+    llama_decode(ctx_tgt, prefill);
+    out->pp_ms = now_ms() - tpp;
+
+    out->output = inp;
+    const double t0 = now_ms();
+
+    for (int n = 0; n < n_predict; ++n) {
+        common_batch_clear(batch);
+        common_batch_add(batch, id_last, n_past++, { 0 }, true);
+        llama_decode(ctx_tgt, batch);
+
+        const llama_token next = common_sampler_sample(smpl, ctx_tgt, -1, false);
+        common_sampler_accept(smpl, next, true);
+
+        out->output.push_back(next);
+        id_last = next;
+        out->n_generated++;
+
+        if (llama_vocab_is_eog(vocab, next)) {
+            break;
+        }
+    }
+
+    out->gen_ms = now_ms() - t0;
+    llama_batch_free(batch);
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    return 0;
+}
+
+static int run_speculative(
+        common_params & params,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_sampler * smpl,
+        common_speculative * spec,
+        std::vector<llama_token> & inp,
+        int n_predict,
+        run_stats * out) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+
+    llama_token id_last = inp.back();
+    llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
+    int n_past = (int) inp.size() - 1;
+
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+
+    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill
+    // batch must be fully formed (llama_batch_get_one leaves those arrays null).
+    llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    for (size_t i = 0; i + 1 < inp.size(); ++i) {
+        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, false);
+    }
+    out->n_prompt = (int) inp.size() - 1;
+    const double tpp = now_ms();
+    llama_decode(ctx_tgt, prefill);
+    // process() fully prepares ctx_dft (encode + KV injection) for DSpark; decoding the
+    // raw prompt tokens on ctx_dft again would collide with the injected positions
+    common_speculative_process(spec, prefill);
+    common_speculative_begin(spec, 0, prompt_tgt);
+    out->pp_ms = now_ms() - tpp;
+
+    out->output = inp;
+    llama_tokens draft;
+    const double t0 = now_ms();
+
+    while (out->n_generated < n_predict) {
+        auto spec_params = params.speculative;
+        spec_params.dspark_temp = params.sampling.temp;
+        spec_params.dspark_seed = params.sampling.seed;
+        common_speculative_sync_params(spec, spec_params);
+
+        draft.clear();
+        common_speculative_get_draft_params(spec, 0) = {
+            true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
+        };
+        common_speculative_draft(spec);
+
+        out->n_propose_steps++;
+        out->n_drafted += (int) draft.size();
+
+        if (draft.empty()) {
+            break;
+        }
+
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { 0 }, true);
+        }
+        llama_decode(ctx_tgt, batch_tgt);
+        common_speculative_process(spec, batch_tgt);
+
+        auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        const int n_acc = (int) ids.size() - 1;
+        out->n_accepted += n_acc;
+
+        common_speculative_accept(spec, 0, (uint16_t) n_acc);
+        n_past += n_acc;
+        for (auto t : ids) {
+            prompt_tgt.push_back(id_last);
+            id_last = t;
+            out->output.push_back(id_last);
+            out->n_generated++;
+            if (llama_vocab_is_eog(vocab, id_last)) {
+                break;
+            }
+        }
+
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
+
+        if (llama_vocab_is_eog(vocab, id_last)) {
+            break;
+        }
+    }
+
+    out->gen_ms = now_ms() - t0;
+    llama_batch_free(batch_tgt);
+    llama_batch_free(prefill);
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    return 0;
+}
+
+static void print_tokens(const char * label, const std::vector<llama_token> & toks, size_t skip) {
+    fprintf(stderr, "%s (%zu tokens):", label, toks.size() > skip ? toks.size() - skip : 0);
+    for (size_t i = skip; i < toks.size(); ++i) {
+        fprintf(stderr, " %d", (int) toks[i]);
+    }
+    fputc('\n', stderr);
+}
+
+static void print_text(llama_context * ctx, const char * label,
+        const std::vector<llama_token> & toks, size_t skip) {
+    std::string text;
+    for (size_t i = skip; i < toks.size(); ++i) {
+        text += common_token_to_piece(ctx, toks[i], true);
+    }
+    fprintf(stderr, "%s text: %s\n", label, text.c_str());
+}
+
+int main(int argc, char ** argv) {
+    common_params params;
+    common_init();
+
+    std::string input_ids_path;
+
+    std::vector<char *> fargv;
+    fargv.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--input-ids") == 0 && i + 1 < argc) {
+            input_ids_path = argv[++i];
+        } else {
+            fargv.push_back(argv[i]);
+        }
+    }
+
+    if (!common_params_parse((int) fargv.size(), fargv.data(), params, LLAMA_EXAMPLE_SPECULATIVE)) {
+        return 1;
+    }
+
+    if (params.model.path.empty() || input_ids_path.empty()) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    // n_ctx=0 loads the model's trained context (262144 for Gemma4/DSpark) and allocates
+    // a full KV cache for both target and draft, which OOMs on typical GPUs.
+    if (params.n_ctx == 0) {
+        params.n_ctx = 512;
+        fprintf(stderr, "note: defaulting context to %d (pass -c to override)\n", params.n_ctx);
+    }
+
+    const bool has_draft = !params.speculative.draft.mparams.path.empty();
+    if (has_draft) {
+        params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        params.speculative.draft.n_max = 7;
+    }
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    auto llama_init_tgt = common_init_from_params(params);
+    llama_context * ctx_tgt = llama_init_tgt->context();
+
+    llama_model_ptr model_dft;
+    llama_context_ptr ctx_dft;
+    common_speculative * spec = nullptr;
+
+    if (has_draft) {
+        auto params_dft = params;
+        params_dft.model         = params.speculative.draft.mparams;
+        params_dft.n_gpu_layers  = params.speculative.draft.n_gpu_layers;
+        params_dft.devices       = params.speculative.draft.devices;
+        if (params.speculative.draft.cpuparams.n_threads > 0) {
+            params_dft.cpuparams.n_threads = params.speculative.draft.cpuparams.n_threads;
+        }
+        params_dft.cpuparams_batch.n_threads = params.speculative.draft.cpuparams_batch.n_threads;
+        params_dft.tensor_buft_overrides     = params.speculative.draft.tensor_buft_overrides;
+        model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(),
+                    common_model_params_to_llama(params_dft)));
+        if (!model_dft) {
+            fprintf(stderr, "failed to load draft model\n");
+            return 1;
+        }
+        ctx_dft.reset(llama_init_from_model(model_dft.get(), common_context_params_to_llama(params_dft)));
+        params.speculative.draft.ctx_tgt = ctx_tgt;
+        params.speculative.draft.ctx_dft = ctx_dft.get();
+        spec = common_speculative_init(params.speculative, 1);
+    }
+
+    std::vector<llama_token> inp;
+    if (!common_load_input_ids_json(input_ids_path, inp)) {
+        return 1;
+    }
+
+    common_sampler_ptr smpl(common_sampler_init(llama_get_model(ctx_tgt), params.sampling));
+
+    const int n_predict = params.n_predict > 0 ? params.n_predict : 32;
+    const size_t n_inp = inp.size();
+
+    run_stats vanilla {};
+    run_stats spec_stats {};
+
+    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+        return 1;
+    }
+
+    common_sampler_reset(smpl.get());
+
+    if (has_draft) {
+        if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "\n=== Vanilla (target only) ===\n");
+    fprintf(stderr, "prompt: %d tokens, pp %.1f ms (%.2f tok/s)\n",
+            vanilla.n_prompt, vanilla.pp_ms,
+            vanilla.pp_ms > 0 ? 1000.0 * vanilla.n_prompt / vanilla.pp_ms : 0.0);
+    fprintf(stderr, "generated: %d tokens in %.1f ms (tgp %.2f tok/s)\n",
+            vanilla.n_generated, vanilla.gen_ms,
+            vanilla.n_generated > 0 ? 1000.0 * vanilla.n_generated / vanilla.gen_ms : 0.0);
+    print_tokens("output", vanilla.output, n_inp);
+    print_text(ctx_tgt, "output", vanilla.output, n_inp);
+
+    if (has_draft) {
+        fprintf(stderr, "\n=== Speculative (draft-dspark) ===\n");
+        fprintf(stderr, "prompt: %d tokens, pp+setup %.1f ms (%.2f tok/s)\n",
+                spec_stats.n_prompt, spec_stats.pp_ms,
+                spec_stats.pp_ms > 0 ? 1000.0 * spec_stats.n_prompt / spec_stats.pp_ms : 0.0);
+        fprintf(stderr, "generated: %d tokens in %.1f ms (tgp %.2f tok/s)\n",
+                spec_stats.n_generated, spec_stats.gen_ms,
+                spec_stats.n_generated > 0 ? 1000.0 * spec_stats.n_generated / spec_stats.gen_ms : 0.0);
+        fprintf(stderr, "propose steps: %d\n", spec_stats.n_propose_steps);
+        fprintf(stderr, "drafted tokens: %d\n", spec_stats.n_drafted);
+        fprintf(stderr, "accepted tokens: %d\n", spec_stats.n_accepted);
+        if (spec_stats.n_drafted > 0) {
+            fprintf(stderr, "accept rate (hit rate): %.1f%%\n", 100.0 * spec_stats.n_accepted / spec_stats.n_drafted);
+        }
+        if (spec_stats.n_propose_steps > 0) {
+            fprintf(stderr, "mean accepted/step: %.2f\n",
+                    (double) spec_stats.n_accepted / (double) spec_stats.n_propose_steps);
+        }
+        print_tokens("output", spec_stats.output, n_inp);
+        print_text(ctx_tgt, "output", spec_stats.output, n_inp);
+
+        fprintf(stderr, "\n=== Comparison ===\n");
+        // the two loops may stop at slightly different lengths, so compare the common prefix
+        const size_t n_cmp = std::min(vanilla.output.size(), spec_stats.output.size());
+        size_t first_mismatch = n_cmp;
+        for (size_t i = n_inp; i < n_cmp; ++i) {
+            if (vanilla.output[i] != spec_stats.output[i]) {
+                first_mismatch = i;
+                break;
+            }
+        }
+        const bool prefix_match = first_mismatch == n_cmp;
+        fprintf(stderr, "token match on common prefix (temp=%.2f): %s\n",
+                params.sampling.temp, prefix_match ? "YES" : "NO");
+        if (!prefix_match) {
+            fprintf(stderr, "first mismatch at gen index %zu: vanilla=%d spec=%d\n",
+                    first_mismatch - n_inp,
+                    (int) vanilla.output[first_mismatch], (int) spec_stats.output[first_mismatch]);
+        }
+        // tokens/s already accounts for token count, so this is a fair throughput ratio
+        const double tgp_v = vanilla.gen_ms    > 0 ? vanilla.n_generated    / vanilla.gen_ms    : 0.0;
+        const double tgp_s = spec_stats.gen_ms > 0 ? spec_stats.n_generated / spec_stats.gen_ms : 0.0;
+        if (tgp_v > 0 && tgp_s > 0) {
+            fprintf(stderr, "tgp speedup: %.2fx\n", tgp_s / tgp_v);
+        }
+    }
+
+    if (spec) {
+        common_speculative_free(spec);
+    }
+    llama_backend_free();
+    return 0;
+}

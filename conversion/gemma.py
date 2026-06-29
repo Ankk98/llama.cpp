@@ -765,6 +765,74 @@ class Gemma4Model(Gemma3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Gemma4DSparkModel")
+class Gemma4DSparkModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.DSPARK
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError(
+                "DSpark draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"DSpark: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        super().set_vocab()
+        self.dir_model = original_dir
+
+        mask_token_id = self.hparams.get("mask_token_id")
+        if mask_token_id is not None:
+            self.gguf_writer.add_mask_token_id(mask_token_id)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        block_size = self.hparams.get("block_size", 7)
+        self.gguf_writer.add_block_size(block_size)
+
+        target_layer_ids = self.hparams.get("target_layer_ids", [])
+        if target_layer_ids:
+            extract_layer_ids = [i + 1 for i in target_layer_ids]
+            self.gguf_writer.add_target_layers(extract_layer_ids)
+
+        self.gguf_writer.add_causal_attention(False)
+
+        markov_rank = int(self.hparams.get("markov_rank", 0))
+        self.gguf_writer.add_markov_rank(markov_rank)
+        if markov_rank > 0:
+            markov_head_type = self.hparams.get("markov_head_type")
+            if markov_head_type != "vanilla":
+                raise ValueError(
+                    f"Unsupported markov_head_type: {markov_head_type!r}. Only 'vanilla' is supported."
+                )
+            self.gguf_writer.add_markov_head_type(markov_head_type)
+
+        enable_confidence_head = bool(self.hparams.get("enable_confidence_head", False))
+        self.gguf_writer.add_enable_confidence_head(enable_confidence_head)
+        if enable_confidence_head:
+            self.gguf_writer.add_confidence_head_with_markov(
+                bool(self.hparams.get("confidence_head_with_markov", False))
+            )
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if not name.startswith("model."):
+            name = "model." + name
+        if ".v_proj." in name or name.endswith(".v_norm.weight"):
+            logger.debug(f"Skipping get tensor {name!r} (k_eq_v=true, no v_proj/v_norm weights).")
+            return None
+        return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # draft dir has no tokenizer; embed is copied from target and already vocab-aligned
+        if "embed_tokens.weight" in name:
+            yield from TextModel.modify_tensors(self, data_torch, name, bid)
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Gemma4UnifiedForConditionalGeneration")
 class Gemma4UnifiedModel(Gemma4Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4

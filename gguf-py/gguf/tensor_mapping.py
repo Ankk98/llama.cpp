@@ -77,6 +77,7 @@ class TensorNameMap:
         MODEL_TENSOR.OUTPUT: (
             "embed_out",                 # gptneox
             "lm_head",                   # gpt2 mpt falcon llama-hf baichuan qwen mamba dbrx jais nemotron exaone olmoe olmo2 phimoe plamo2
+            "model.lm_head",             # dspark
             "output",                    # llama-pth bloom internlm2
             "word_embeddings_for_head",  # persimmon
             "lm_head.linear",            # phi2
@@ -1288,6 +1289,18 @@ class TensorNameMap:
 
         MODEL_TENSOR.FC: (
             "model.fc", # dflash
+        ),
+
+        MODEL_TENSOR.MARKOV_W1: (
+            "model.markov_head.markov_w1", # dspark
+        ),
+
+        MODEL_TENSOR.MARKOV_W2: (
+            "model.markov_head.markov_w2", # dspark
+        ),
+
+        MODEL_TENSOR.CONFIDENCE_PROJ: (
+            "model.confidence_head.proj", # dspark
         ),
 
         MODEL_TENSOR.CLS: (
