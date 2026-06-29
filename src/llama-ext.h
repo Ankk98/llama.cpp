@@ -155,3 +155,20 @@ LLAMA_API void                             llama_dspark_markov_gpu_free(struct l
 
 // Writes bias[n_vocab] = markov_w2 @ markov_w1[:, prev_token] into out (caller-allocated).
 LLAMA_API bool llama_dspark_markov_gpu_bias(struct llama_dspark_markov_gpu * h, int32_t prev_token, float * out);
+
+// DSpark greedy block sampler, fully fused on the markov-weight backend. The autoregressive
+// markov chain (softcap -> +markov_bias -> argmax -> feed next position) for an entire block is
+// unrolled into a SINGLE graph submit, so the per-step cost is one dispatch instead of block_size
+// separate matvec round-trips, and only block_size token ids are read back (no n_vocab copyback).
+// Greedy/argmax only (temperature 0); callers needing sampled probs use the CPU path.
+struct llama_dspark_block_sample_gpu;
+
+LLAMA_API struct llama_dspark_block_sample_gpu * llama_dspark_block_sample_gpu_init(
+        const struct llama_model * model, int32_t block_size, float logit_softcap);
+LLAMA_API void llama_dspark_block_sample_gpu_free(struct llama_dspark_block_sample_gpu * h);
+
+// logits: block_size * n_vocab floats, position-major (position i at logits + i*n_vocab).
+// anchor: id_last (token before position 0). out_tokens: caller-allocated int32[block_size].
+// Returns false on failure so the caller can fall back to the per-position CPU path.
+LLAMA_API bool llama_dspark_block_sample_gpu_run(
+        struct llama_dspark_block_sample_gpu * h, const float * logits, int32_t anchor, int32_t * out_tokens);

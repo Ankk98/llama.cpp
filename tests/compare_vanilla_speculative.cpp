@@ -17,6 +17,8 @@ struct run_stats {
     std::vector<llama_token> output;
     double pp_ms = 0;
     double gen_ms = 0;
+    double draft_ms = 0;  // time inside common_speculative_draft (draft fwd + cpu sampling)
+    double verify_ms = 0; // time inside target decode + accept
     int n_prompt = 0;
     int n_generated = 0;
     int n_drafted = 0;
@@ -137,7 +139,9 @@ static int run_speculative(
         common_speculative_get_draft_params(spec, 0) = {
             true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
         };
+        const double td0 = now_ms();
         common_speculative_draft(spec);
+        out->draft_ms += now_ms() - td0;
 
         out->n_propose_steps++;
         out->n_drafted += (int) draft.size();
@@ -151,19 +155,25 @@ static int run_speculative(
         for (size_t i = 0; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + (llama_pos) i, { 0 }, true);
         }
+        const double tv0 = now_ms();
         llama_decode(ctx_tgt, batch_tgt);
         common_speculative_process(spec, batch_tgt);
 
         auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+        out->verify_ms += now_ms() - tv0;
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
 
-        if (getenv("DSPARK_DEBUG") && out->n_propose_steps <= 12) {
-            fprintf(stderr, "[step %2d] draft:", out->n_propose_steps);
-            for (auto d : draft) fprintf(stderr, " %d", (int) d);
-            fprintf(stderr, "  | target:");
-            for (auto t : ids) fprintf(stderr, " %d", (int) t);
-            fprintf(stderr, "  | accepted %d/%d\n", n_acc, (int) draft.size());
+        if (getenv("DSPARK_DEBUG")) {
+            fprintf(stderr, "\n[step %2d] anchor='%s'\n", out->n_propose_steps,
+                    common_token_to_piece(ctx_tgt, id_last, true).c_str());
+            fprintf(stderr, "  proposed (%d):", (int) draft.size());
+            for (auto d : draft) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, d, true).c_str());
+            fprintf(stderr, "\n  accepted %d/%d:", n_acc, (int) draft.size());
+            for (int i = 0; i < n_acc; ++i) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, draft[i], true).c_str());
+            fprintf(stderr, "\n  committed (+bonus):");
+            for (auto t : ids) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, t, true).c_str());
+            fputc('\n', stderr);
         }
 
         common_speculative_accept(spec, 0, (uint16_t) n_acc);
@@ -333,6 +343,17 @@ int main(int argc, char ** argv) {
         if (spec_stats.n_propose_steps > 0) {
             fprintf(stderr, "mean accepted/step: %.2f\n",
                     (double) spec_stats.n_accepted / (double) spec_stats.n_propose_steps);
+            const double v_fwd = vanilla.n_generated > 0 ? vanilla.gen_ms / vanilla.n_generated : 0.0;
+            const double d_step = spec_stats.draft_ms  / spec_stats.n_propose_steps;
+            const double vf_step = spec_stats.verify_ms / spec_stats.n_propose_steps;
+            const double tok_step = (double) spec_stats.n_generated / spec_stats.n_propose_steps;
+            fprintf(stderr, "--- per-pass timing ---\n");
+            fprintf(stderr, "  target forward (vanilla, 1 tok)   : %.2f ms\n", v_fwd);
+            fprintf(stderr, "  draft  step (fwd + cpu sampling)  : %.2f ms  (proposes %d)\n", d_step, (int) spec_stats.n_drafted / std::max(1, spec_stats.n_propose_steps));
+            fprintf(stderr, "  verify step (target fwd + accept) : %.2f ms\n", vf_step);
+            fprintf(stderr, "  => %.2f ms/propose for %.2f tokens = %.2f ms/token (vanilla %.2f ms/token)\n",
+                    d_step + vf_step, tok_step,
+                    tok_step > 0 ? (d_step + vf_step) / tok_step : 0.0, v_fwd);
         }
         print_tokens("output", spec_stats.output, n_inp);
         print_text(ctx_tgt, "output", spec_stats.output, n_inp);

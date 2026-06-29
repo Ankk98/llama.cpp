@@ -2877,3 +2877,117 @@ bool llama_dspark_markov_gpu_bias(llama_dspark_markov_gpu * h, int32_t prev_toke
     ggml_backend_tensor_get(h->out_bias, out, 0, (size_t) h->n_vocab * sizeof(float));
     return true;
 }
+
+struct llama_dspark_block_sample_gpu {
+    ggml_backend_t backend    = nullptr;
+    ggml_context * ctx        = nullptr;
+    ggml_gallocr_t galloc     = nullptr;
+    ggml_cgraph *  gf         = nullptr;
+    ggml_tensor *  inp_logits = nullptr; // [n_vocab, block_size]
+    ggml_tensor *  inp_anchor = nullptr; // [1] I32
+    std::vector<ggml_tensor *> out_tok;  // block_size scalars (I32)
+    int32_t        n_vocab    = 0;
+    int32_t        block_size = 0;
+};
+
+llama_dspark_block_sample_gpu * llama_dspark_block_sample_gpu_init(
+        const llama_model * model, int32_t block_size, float logit_softcap) {
+    if (model == nullptr || model->arch != LLM_ARCH_DSPARK || block_size <= 0) {
+        return nullptr;
+    }
+    if (model->hparams.markov_rank == 0 || model->markov_w1 == nullptr || model->markov_w2 == nullptr) {
+        return nullptr;
+    }
+
+    auto * h = new llama_dspark_block_sample_gpu();
+    h->n_vocab    = (int32_t) llama_vocab_n_tokens(llama_model_get_vocab(model));
+    h->block_size = block_size;
+
+    ggml_backend_dev_t dev = nullptr;
+    if (model->markov_w1->buffer != nullptr) {
+        dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model->markov_w1->buffer));
+    }
+    h->backend = dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_cpu_init();
+    if (h->backend == nullptr) {
+        delete h;
+        return nullptr;
+    }
+
+    // ~12 nodes per block position; size generously
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (block_size * 16 + 32) + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    h->ctx = ggml_init(ip);
+
+    h->inp_logits = ggml_new_tensor_2d(h->ctx, GGML_TYPE_F32, h->n_vocab, block_size);
+    ggml_set_input(h->inp_logits);
+    ggml_set_name(h->inp_logits, "block_logits");
+
+    h->inp_anchor = ggml_new_tensor_1d(h->ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(h->inp_anchor);
+    ggml_set_name(h->inp_anchor, "block_anchor");
+
+    h->gf = ggml_new_graph(h->ctx);
+    h->out_tok.resize(block_size);
+
+    ggml_tensor * prev_idx = h->inp_anchor; // token feeding position 0's markov lookup
+    for (int32_t i = 0; i < block_size; ++i) {
+        ggml_tensor * latent = ggml_get_rows(h->ctx, model->markov_w1, prev_idx); // [rank, 1]
+        latent = ggml_cast(h->ctx, latent, GGML_TYPE_F32);
+        ggml_tensor * bias = ggml_mul_mat(h->ctx, model->markov_w2, latent);       // [n_vocab, 1]
+
+        ggml_tensor * logit_i = ggml_view_1d(h->ctx, h->inp_logits, h->n_vocab,
+                (size_t) i * h->n_vocab * sizeof(float));                           // [n_vocab]
+
+        ggml_tensor * sc = logit_i;
+        if (logit_softcap > 0.0f) {
+            sc = ggml_scale(h->ctx, ggml_tanh(h->ctx, ggml_scale(h->ctx, sc, 1.0f / logit_softcap)), logit_softcap);
+        }
+
+        ggml_tensor * val = ggml_add(h->ctx, sc, bias);                            // [n_vocab]
+        ggml_tensor * tok = ggml_argmax(h->ctx, val);                              // [1] I32
+        ggml_set_output(tok);
+
+        h->out_tok[i] = tok;
+        ggml_build_forward_expand(h->gf, tok);
+
+        prev_idx = tok; // autoregressive: this position's argmax feeds the next markov lookup
+    }
+
+    h->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(h->backend));
+    if (!ggml_gallocr_alloc_graph(h->galloc, h->gf)) {
+        llama_dspark_block_sample_gpu_free(h);
+        return nullptr;
+    }
+
+    return h;
+}
+
+void llama_dspark_block_sample_gpu_free(llama_dspark_block_sample_gpu * h) {
+    if (h == nullptr) {
+        return;
+    }
+    if (h->galloc)  { ggml_gallocr_free(h->galloc); }
+    if (h->ctx)     { ggml_free(h->ctx); }
+    if (h->backend) { ggml_backend_free(h->backend); }
+    delete h;
+}
+
+bool llama_dspark_block_sample_gpu_run(
+        llama_dspark_block_sample_gpu * h, const float * logits, int32_t anchor, int32_t * out_tokens) {
+    if (h == nullptr || logits == nullptr || out_tokens == nullptr) {
+        return false;
+    }
+    ggml_backend_tensor_set(h->inp_anchor, &anchor, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(h->inp_logits, logits, 0,
+            (size_t) h->n_vocab * (size_t) h->block_size * sizeof(float));
+    if (ggml_backend_graph_compute(h->backend, h->gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    for (int32_t i = 0; i < h->block_size; ++i) {
+        ggml_backend_tensor_get(h->out_tok[i], &out_tokens[i], 0, sizeof(int32_t));
+    }
+    return true;
+}

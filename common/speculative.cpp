@@ -1326,7 +1326,19 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
     llama_dspark_markov_gpu * markov_gpu = nullptr;
 
+    // fused single-submit greedy block sampler (softcap + markov + argmax for the whole block)
+    llama_dspark_block_sample_gpu * block_gpu = nullptr;
+    std::vector<float>              block_logits;
+
     std::vector<std::mt19937> rngs;
+
+    // optional profiling (DSPARK_PROF=1): splits each propose into draft-forward vs CPU-sampling
+    bool    prof           = false;
+    int64_t prof_decode_us = 0;
+    int64_t prof_sample_us = 0;
+    int64_t prof_markov_us = 0;
+    int64_t prof_argmax_us = 0;
+    int64_t prof_steps     = 0;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq)
@@ -1335,6 +1347,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         , temperature(params.dspark_temp)
         , disable_markov(params.dspark_disable_markov)
     {
+        prof = getenv("DSPARK_PROF") != nullptr;
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "DSpark requires ctx_tgt and ctx_dft to be set");
@@ -1385,6 +1398,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             if (!getenv("DSPARK_MARKOV_CPU")) {
                 markov_gpu = llama_dspark_markov_gpu_init(model_dft);
                 LOG_INF("%s: - markov head running on %s\n", __func__, markov_gpu ? "GPU/backend" : "CPU");
+
+                if (markov_gpu && !getenv("DSPARK_NO_BLOCK_GPU")) {
+                    block_gpu = llama_dspark_block_sample_gpu_init(model_dft, block_size, dspark_w.logit_softcap);
+                    LOG_INF("%s: - greedy block sampler on %s\n", __func__,
+                            block_gpu ? "GPU (fused single-submit)" : "CPU per-position");
+                }
             }
         }
 
@@ -1403,10 +1422,22 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dspark() override {
+        if (prof && prof_steps > 0) {
+            LOG_INF("%s: [PROF] %lld steps: draft-fwd %.2f | sampling %.2f (markov %.2f + argmax/softcap %.2f) ms/step (block=%d)\n",
+                    __func__, (long long) prof_steps,
+                    1e-3 * prof_decode_us / prof_steps,
+                    1e-3 * prof_sample_us / prof_steps,
+                    1e-3 * prof_markov_us / prof_steps,
+                    1e-3 * prof_argmax_us / prof_steps,
+                    block_size);
+        }
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
         if (markov_gpu) {
             llama_dspark_markov_gpu_free(markov_gpu);
+        }
+        if (block_gpu) {
+            llama_dspark_block_sample_gpu_free(block_gpu);
         }
     }
 
@@ -1523,6 +1554,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
         common_batch_clear(batch);
 
+        // the confidence head only matters when it can actually truncate the block; at
+        // threshold <= 0 the full block is always proposed, so skip the per-position hidden
+        // state read, the confidence logits and the extra embeddings output during decode
+        const bool use_confidence = dspark_w.enable_confidence_head && confidence_threshold > 0.0f;
+
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
@@ -1556,18 +1592,24 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
         // the confidence head reads per-token hidden states (t_embd) from this decode;
         // embeddings stay off during process()'s encode, whose graph has no t_embd
-        if (dspark_w.enable_confidence_head) {
+        if (use_confidence) {
             llama_set_embeddings(ctx_dft, true);
         }
 
+        const int64_t t_dec0 = prof ? ggml_time_us() : 0;
         int ret = llama_decode(ctx_dft, batch);
-        if (dspark_w.enable_confidence_head) {
+        if (prof) {
+            prof_decode_us += ggml_time_us() - t_dec0;
+        }
+        if (use_confidence) {
             llama_set_embeddings(ctx_dft, false);
         }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
+
+        const int64_t t_smp0 = prof ? ggml_time_us() : 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1588,7 +1630,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             std::vector<llama_token> sampled;
             std::vector<float>       conf_logits;
             sampled.reserve(block_size);
-            if (dspark_w.enable_confidence_head) {
+            if (use_confidence) {
                 conf_logits.reserve(block_size);
             }
 
@@ -1602,12 +1644,45 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             const bool  use_markov = !disable_markov && dspark_w.markov_rank > 0;
             const float softcap    = dspark_w.logit_softcap;
 
-            for (int32_t i = 0; i < block_size; ++i) {
+            // fused single-submit GPU path: greedy, markov on, no probs/confidence needed.
+            // gathers the block logits and runs softcap+markov+argmax for all positions in one
+            // graph dispatch, reading back only the block_size token ids (no n_vocab copyback).
+            bool block_done = false;
+            if (block_gpu && use_markov && temperature < 1e-5f && !dp.draft_probs && !use_confidence) {
+                // the block positions' logits are contiguous in the output buffer in the common
+                // (single-seq) case, so pass them directly; only gather/copy when they are not
+                const float * base = llama_get_logits_ith(ctx_dft, beg);
+                GGML_ASSERT(base);
+                const float * block_ptr = base;
+                if (llama_get_logits_ith(ctx_dft, beg + block_size - 1) != base + (size_t) (block_size - 1) * n_vocab) {
+                    block_logits.resize((size_t) block_size * n_vocab);
+                    for (int32_t i = 0; i < block_size; ++i) {
+                        const float * lp = llama_get_logits_ith(ctx_dft, beg + i);
+                        GGML_ASSERT(lp);
+                        std::memcpy(block_logits.data() + (size_t) i * n_vocab, lp, (size_t) n_vocab * sizeof(float));
+                    }
+                    block_ptr = block_logits.data();
+                }
+                std::vector<int32_t> toks(block_size);
+                const int64_t t_b0 = prof ? ggml_time_us() : 0;
+                if (llama_dspark_block_sample_gpu_run(block_gpu, block_ptr, (int32_t) dp.id_last, toks.data())) {
+                    for (int32_t i = 0; i < block_size; ++i) {
+                        sampled.push_back((llama_token) toks[i]);
+                    }
+                    block_done = true;
+                }
+                if (prof) {
+                    prof_markov_us += ggml_time_us() - t_b0;
+                }
+            }
+
+            for (int32_t i = 0; !block_done && i < block_size; ++i) {
                 const float * raw_logits = llama_get_logits_ith(ctx_dft, beg + i);
                 GGML_ASSERT(raw_logits);
 
                 // markov bias is autoregressive (depends on the previous sampled token), so the
                 // per-position chain cannot be batched; the heavy matvec runs on the GPU/backend
+                const int64_t t_mk0 = prof ? ggml_time_us() : 0;
                 if (use_markov) {
                     dspark_markov_latent(dspark_w, prev_token, markov_latent.data());
                     if (markov_gpu == nullptr ||
@@ -1615,7 +1690,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         dspark_markov_bias(dspark_w, markov_latent.data(), markov_bias.data());
                     }
                 }
+                if (prof) {
+                    prof_markov_us += ggml_time_us() - t_mk0;
+                }
 
+                const int64_t t_am0 = prof ? ggml_time_us() : 0;
                 llama_token id;
                 if (temperature < 1e-5f && !dp.draft_probs) {
                     // greedy fast path: fuse softcap + bias into a single argmax pass, skipping the
@@ -1651,11 +1730,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                     id = dspark_sample_from_probs(probs, rngs[seq_id]);
                 }
+                if (prof) {
+                    prof_argmax_us += ggml_time_us() - t_am0;
+                }
 
                 sampled.push_back(id);
                 prev_token = id;
 
-                if (dspark_w.enable_confidence_head) {
+                if (use_confidence) {
                     const float * hidden = llama_get_embeddings_ith(ctx_dft, beg + i);
                     GGML_ASSERT(hidden);
                     std::vector<float> prev_emb;
@@ -1670,7 +1752,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 
             int proposal_len = block_size;
-            if (dspark_w.enable_confidence_head && !conf_logits.empty()) {
+            if (use_confidence && !conf_logits.empty()) {
                 proposal_len = dspark_confident_prefix_length(
                         conf_logits, block_size, confidence_threshold);
             } else {
@@ -1689,6 +1771,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+        }
+
+        if (prof) {
+            prof_sample_us += ggml_time_us() - t_smp0;
+            prof_steps++;
         }
     }
 
