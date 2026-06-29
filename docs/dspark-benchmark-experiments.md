@@ -3,6 +3,8 @@
 Living log for DSpark speculative decoding performance on llama.cpp.
 **Fair methodology only** - numbers below use vanilla-first + 3s cooldown unless noted.
 
+**NVIDIA CUDA results:** see [dspark-benchmark-nvidia.md](dspark-benchmark-nvidia.md) (RTX 3090, ~2.0x coding speedup).
+
 ## Environment
 
 | Item | Value |
