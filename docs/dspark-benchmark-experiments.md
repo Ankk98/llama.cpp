@@ -158,7 +158,7 @@ A **5-10% structural gain** on coding would mean fair **1.69-1.77x** - not yet a
 | 2026-06-29 | 889ae1063 | Adaptive upscale, profiling | spec-first inflated |
 | 2026-06-29 | bdf0f0308 | pp/tgp table, process sync skip | spec-first inflated |
 | 2026-06-29 | 843457e | **Fair harness** (vanilla-first + cooldown) | **1.61x** honest |
-| 2026-06-29 | (pending) | GPU greedy verify + defer layer D2H + verify graph warmup | re-run fair bench |
+| 2026-06-29 | f360dae | GPU greedy verify + defer layer D2H + verify graph warmup | re-run fair bench |
 
 ## Open work (structural only)
 
