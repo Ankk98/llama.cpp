@@ -22,6 +22,7 @@ struct run_stats {
     double tgt_decode_ms = 0;
     double verify_accept_ms = 0;
     double verify_features_ms = 0;
+    double verify_decode_submit_ms = 0;
     double verify_process_ms = 0;
     int n_prompt = 0;
     int n_generated = 0;
@@ -196,6 +197,7 @@ static int run_speculative(
             out->verify_accept_ms  += vtim.accept_ms;
             out->verify_features_ms += vtim.features_decode_ms;
             out->verify_process_ms += vtim.process_ms;
+            out->verify_decode_submit_ms += vtim.decode_submit_ms;
             out->verify_ms         += vtim.logits_decode_ms + vtim.accept_ms + vtim.process_ms;
         }
 
@@ -295,6 +297,7 @@ int main(int argc, char ** argv) {
     if (has_draft) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
         // keep params.speculative.draft.n_max from --spec-draft-n-max (default 3)
+        fprintf(stderr, "note: speculative runs before vanilla (thermal: spec gets cooler GPU)\n");
     }
 
     llama_backend_init();
@@ -355,18 +358,16 @@ int main(int argc, char ** argv) {
     run_stats vanilla {};
     run_stats spec_stats {};
 
-    // Run vanilla first so the baseline is measured on a cold GPU; speculative
-    // pays any thermal cost and speedup is not inflated by run order.
-    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
-        return 1;
-    }
-
-    common_sampler_reset(smpl.get());
-
     if (has_draft) {
         if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
             return 1;
         }
+    }
+
+    common_sampler_reset(smpl.get());
+
+    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+        return 1;
     }
 
     fprintf(stderr, "\n=== Vanilla (target only) ===\n");
@@ -406,6 +407,8 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "  verify step (batched)            : %.2f ms\n", vf_step);
             fprintf(stderr, "    logits decode (full block)     : %.2f ms\n",
                     (spec_stats.tgt_decode_ms - spec_stats.verify_features_ms) / spec_stats.n_propose_steps);
+            fprintf(stderr, "    decode submit (no sync)      : %.2f ms\n",
+                    spec_stats.verify_decode_submit_ms / spec_stats.n_propose_steps);
             fprintf(stderr, "    accept (sampling)              : %.2f ms\n",
                     spec_stats.verify_accept_ms / spec_stats.n_propose_steps);
             fprintf(stderr, "    feature re-decode (committed)  : %.2f ms\n",

@@ -75,7 +75,8 @@ void common_speculative_sync_params(common_speculative * spec, const common_para
 void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
 
 struct common_speculative_dspark_verify_timing {
-    double logits_decode_ms = 0;
+    double decode_submit_ms = 0; // llama_decode only (no GPU sync)
+    double logits_decode_ms = 0; // decode + accept sync
     double accept_ms        = 0;
     double features_decode_ms = 0;
     double process_ms       = 0;

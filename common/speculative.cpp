@@ -1608,11 +1608,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
             }
-            // on low hit-rate prompts, shorter blocks cut verify cost more than they hurt acceptance
+            // adaptive block length from rolling hit rate (coding vs agentic)
             if (!getenv("DSPARK_NO_ADAPTIVE_NMAX") && n_acc_drafts >= 8 && n_gen_tokens > 0) {
                 const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
                 if (hit < 0.58f) {
                     n_draft = std::min(n_draft, 2);
+                } else if (hit > 0.72f) {
+                    n_draft = std::min(params.n_max, block_size);
                 }
             }
             n_draft = std::min(n_draft, block_size);
@@ -1669,6 +1671,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 const float hit = (float) n_acc_tokens / (float) n_gen_tokens;
                 if (hit < 0.58f) {
                     n_draft = std::min(n_draft, 2);
+                } else if (hit > 0.72f) {
+                    n_draft = std::min(params.n_max, block_size);
                 }
             }
             n_draft = std::min(n_draft, block_size);
@@ -3285,6 +3289,8 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
+    const int64_t t_decode = timing ? ggml_time_us() : 0;
+
     if (timing) {
         timing->logits_decode_ms = 0; // filled in with accept (includes GPU sync)
     }
@@ -3304,8 +3310,9 @@ bool common_speculative_dspark_verify_batched(
 
     if (timing) {
         const int64_t t1_end = ggml_time_us();
-        timing->accept_ms        = 1e-3 * (t1_end - t1);
-        timing->logits_decode_ms = 1e-3 * (t1_end - t0);
+        timing->decode_submit_ms   = 1e-3 * (t_decode - t0);
+        timing->accept_ms          = 1e-3 * (t1_end - t1);
+        timing->logits_decode_ms   = 1e-3 * (t1_end - t0);
     }
 
     if (out_ids.empty()) {
