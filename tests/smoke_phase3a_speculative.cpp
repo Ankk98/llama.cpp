@@ -139,16 +139,11 @@ int main(int argc, char ** argv) {
     int n_past = (int) inp.size() - 1;
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    llama_batch prefill   = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill
-    // batch must be fully formed (llama_batch_get_one leaves those arrays null).
-    llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-    for (size_t i = 0; i + 1 < inp.size(); ++i) {
-        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, false);
+    if (!common_speculative_dspark_prefill(spec, ctx_tgt, inp, prefill, false, nullptr)) {
+        return 1;
     }
-    llama_decode(ctx_tgt, prefill);
-    common_speculative_process(spec, prefill);
-
     common_speculative_begin(spec, 0, prompt_tgt);
 
     llama_tokens output = inp;

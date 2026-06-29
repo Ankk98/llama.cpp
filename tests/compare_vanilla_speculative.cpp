@@ -57,11 +57,34 @@ static int run_vanilla(
         run_stats * out) {
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
 
+    llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+
+#if defined(GGML_USE_CUDA)
+    // Match spec KV layout: full-prompt prefill + first-token sample (CUDA vanilla
+    // single-token prefill diverges from spec verify around gen index 34).
     llama_token id_last = inp.back();
-    llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
+    int n_past = (int) inp.size();
+
+    llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    for (size_t i = 0; i < inp.size(); ++i) {
+        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, i + 1 == inp.size());
+    }
+    out->n_prompt = (int) inp.size();
+    const double tpp = now_ms();
+    llama_decode(ctx_tgt, prefill);
+    llama_batch_free(prefill);
+
+    id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
+    common_sampler_accept(smpl, id_last, true);
+    out->pp_ms = now_ms() - tpp;
+
+    out->output = inp;
+    out->output.push_back(id_last);
+    out->n_generated = 1;
+#else
+    llama_token id_last = inp.back();
     int n_past = (int) inp.size() - 1;
 
-    llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
     llama_batch prefill = llama_batch_get_one(inp.data(), (int) inp.size() - 1);
     out->n_prompt = (int) inp.size() - 1;
     const double tpp = now_ms();
@@ -69,9 +92,12 @@ static int run_vanilla(
     out->pp_ms = now_ms() - tpp;
 
     out->output = inp;
+    out->n_generated = 0;
+#endif
+
     const double t0 = now_ms();
 
-    for (int n = 0; n < n_predict; ++n) {
+    while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
         common_batch_clear(batch);
         common_batch_add(batch, id_last, n_past++, { 0 }, true);
         llama_decode(ctx_tgt, batch);
@@ -145,9 +171,17 @@ static int run_speculative(
     const double tpp = now_ms();
     llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
     llama_context * const ctx_prefill = ctx_tgt;
+    const bool prefill_defer = getenv("DSPARK_PREFILL_DEFER") != nullptr;
+    if (prefill_defer) {
+        llama_set_defer_layer_inp_extract(ctx_prefill, true);
+    }
     llama_decode(ctx_prefill, prefill);
     if (ctx_feat) {
         llama_decode(ctx_feat, prefill);
+    }
+    if (prefill_defer) {
+        llama_commit_layer_inputs(ctx_prefill, inp.size());
+        llama_set_defer_layer_inp_extract(ctx_prefill, false);
     }
     common_speculative_process(spec, prefill);
     common_speculative_begin(spec, 0, prompt_tgt);

@@ -74,6 +74,21 @@ void common_speculative_sync_params(common_speculative * spec, const common_para
 // DSpark: toggle expensive target layer-input extraction (5 hidden tensors per token)
 void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
 
+struct common_speculative_dspark_prefill_timing {
+    double fast_ms  = 0; // target decode with layer taps off (optional first pass)
+    double setup_ms = 0; // target decode with layer taps on + process()
+};
+
+// DSpark/DeepSpec prefill: target decode inp[0..n-2], then process() into draft KV.
+// fast_ttft: layer-tap-free decode first (fast_ms), then feature decode + process (setup_ms).
+bool common_speculative_dspark_prefill(
+        common_speculative * spec,
+        struct llama_context * ctx_tgt,
+        const llama_tokens & inp,
+        struct llama_batch & batch,
+        bool fast_ttft,
+        common_speculative_dspark_prefill_timing * timing = nullptr);
+
 struct common_speculative_dspark_verify_timing {
     double decode_submit_ms   = 0; // llama_decode return (async, no GPU sync)
     double logits_decode_ms   = 0; // same as decode_submit_ms (legacy alias)
@@ -94,7 +109,7 @@ bool common_speculative_dspark_process_committed(
         const llama_tokens & committed_ids,
         struct llama_batch & batch);
 
-// DSpark: optimized batched verify (single target forward with layer features, truncated process)
+// DSpark: batched verify (logits-only forward, then committed feature re-decode + process)
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,

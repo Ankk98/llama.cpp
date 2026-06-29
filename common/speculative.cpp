@@ -3264,6 +3264,94 @@ void common_speculative_dspark_target_features_enable(common_speculative * spec,
     }
 }
 
+static llama_context * dspark_ctx_feat_from_spec(common_speculative * spec) {
+    if (spec == nullptr) {
+        return nullptr;
+    }
+    for (auto & impl : spec->impls) {
+        if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
+            return f;
+        }
+    }
+    return nullptr;
+}
+
+bool common_speculative_dspark_prefill(
+        common_speculative * spec,
+        llama_context * ctx_tgt,
+        const llama_tokens & inp,
+        llama_batch & batch,
+        bool fast_ttft,
+        common_speculative_dspark_prefill_timing * timing) {
+    if (spec == nullptr || ctx_tgt == nullptr) {
+        return false;
+    }
+
+    const int32_t n_prefill = (int32_t) inp.size() - 1;
+    if (n_prefill <= 0) {
+        return true;
+    }
+
+    llama_context * const ctx_feat = dspark_ctx_feat_from_spec(spec);
+
+    auto build_prefill = [&]() {
+        common_batch_clear(batch);
+        for (int32_t i = 0; i < n_prefill; ++i) {
+            common_batch_add(batch, inp[i], (llama_pos) i, { 0 }, false);
+        }
+    };
+
+    auto decode_prefill = [&](bool features_on) -> bool {
+        common_speculative_dspark_target_features_enable(spec, features_on);
+        build_prefill();
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            return false;
+        }
+        if (features_on && ctx_feat) {
+            if (llama_decode(ctx_feat, batch) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (fast_ttft) {
+        const int64_t t0 = timing ? ggml_time_us() : 0;
+        if (!decode_prefill(false)) {
+            return false;
+        }
+        if (timing) {
+            timing->fast_ms = 1e-3 * (ggml_time_us() - t0);
+        }
+
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+
+        const int64_t t1 = timing ? ggml_time_us() : 0;
+        if (!decode_prefill(true)) {
+            return false;
+        }
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
+        if (timing) {
+            timing->setup_ms = 1e-3 * (ggml_time_us() - t1);
+        }
+        return true;
+    }
+
+    const int64_t t0 = timing ? ggml_time_us() : 0;
+    if (!decode_prefill(true)) {
+        return false;
+    }
+    if (!common_speculative_process(spec, batch)) {
+        return false;
+    }
+    if (timing) {
+        timing->setup_ms = 1e-3 * (ggml_time_us() - t0);
+    }
+    return true;
+}
+
 static void dspark_build_committed_batch(
         llama_batch & batch,
         llama_seq_id seq_id,
@@ -3301,9 +3389,10 @@ bool common_speculative_dspark_process_committed(
     return common_speculative_process(spec, batch);
 }
 
-// Batched verify: one logits target forward, accept, then process() on the committed prefix.
-// When ctx_tgt_feat is set (shared KV, layer outputs only on ctx_feat), the verify logits
-// path avoids 5x layer-input extraction on the full draft block.
+// Batched verify: one target forward for logits, accept, then feature re-decode on the
+// committed prefix and process() into draft KV. CUDA builds use this path by default
+// (layer taps on multi-token verify graphs diverge from vanilla). Vulkan keeps the defer
+// fast path unless DSPARK_FORCE_VERIFY_COMMITTED=1. Override: DSPARK_VERIFY_DEFER=1 (CUDA).
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
@@ -3323,6 +3412,15 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
+#if defined(GGML_USE_CUDA)
+    // Batched multi-token target verify diverges on CUDA; sequential matches vanilla.
+    // Opt in with DSPARK_VERIFY_BATCHED=1. draft_probs (temp>0) still uses batched.
+    if (getenv("DSPARK_VERIFY_BATCHED") == nullptr && (draft_probs == nullptr || draft_probs->empty())) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+#endif
+
     llama_context * ctx_feat = nullptr;
     for (auto & impl : spec->impls) {
         if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
@@ -3331,6 +3429,16 @@ bool common_speculative_dspark_verify_batched(
     }
 
     const bool split_verify = ctx_feat != nullptr && getenv("DSPARK_NO_SPLIT_VERIFY") == nullptr;
+
+#if defined(GGML_USE_CUDA)
+    const bool force_committed = getenv("DSPARK_VERIFY_DEFER") == nullptr;
+#else
+    const bool force_committed = getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
+            || getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
+#endif
+
+    const bool defer_layers = !split_verify && !force_committed
+            && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
 
     common_batch_clear(batch);
     common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
@@ -3351,41 +3459,25 @@ bool common_speculative_dspark_verify_batched(
             && getenv("DSPARK_GPU_GREEDY") != nullptr
             && getenv("DSPARK_NO_GPU_GREEDY") == nullptr;
 
-    const bool logits_only = !split_verify && getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
-    const bool defer_layers = !split_verify && !logits_only && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
-
     if (fused_argmax) {
         dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, seq_id);
     }
 
-    if (logits_only) {
-        common_speculative_dspark_target_features_enable(spec, false);
-    }
+    common_speculative_dspark_target_features_enable(spec, defer_layers);
 
     if (defer_layers) {
         llama_set_defer_layer_inp_extract(ctx_tgt, true);
     }
 
-    auto cleanup_verify_flags = [&]() {
-        if (logits_only) {
-            common_speculative_dspark_target_features_enable(spec, true);
-        }
-    };
-
     if (llama_decode(ctx_tgt, batch) != 0) {
         if (defer_layers) {
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
-        cleanup_verify_flags();
+        common_speculative_dspark_target_features_enable(spec, true);
         return false;
     }
 
     const int64_t t_decode = timing ? ggml_time_us() : 0;
-
-    if (timing) {
-        timing->logits_decode_ms = 0; // filled in with accept (includes GPU sync)
-    }
-
     const int64_t t1 = timing ? ggml_time_us() : 0;
 
     if (draft_probs != nullptr && !draft_probs->empty()) {
@@ -3418,39 +3510,24 @@ bool common_speculative_dspark_verify_batched(
         timing->logits_decode_ms   = 1e-3 * (t_decode - t0);
     }
 
-    const int64_t t_commit = timing ? ggml_time_us() : 0;
-
-    if (defer_layers) {
-        llama_commit_layer_inputs(ctx_tgt, out_ids.size());
-        llama_set_defer_layer_inp_extract(ctx_tgt, false);
-    }
-
-    cleanup_verify_flags();
-
-    if (timing && defer_layers) {
-        timing->layer_commit_ms = 1e-3 * (ggml_time_us() - t_commit);
-    } else if (timing) {
-        timing->layer_commit_ms = 0;
-    }
-
     if (out_ids.empty()) {
+        if (defer_layers) {
+            llama_set_defer_layer_inp_extract(ctx_tgt, false);
+        }
+        common_speculative_dspark_target_features_enable(spec, true);
         return false;
     }
 
-    if (logits_only) {
-        const int64_t t_feat = timing ? ggml_time_us() : 0;
+    if (defer_layers) {
+        const int64_t t_commit = timing ? ggml_time_us() : 0;
 
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
-        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
-
+        llama_commit_layer_inputs(ctx_tgt, out_ids.size());
+        llama_set_defer_layer_inp_extract(ctx_tgt, false);
         common_speculative_dspark_target_features_enable(spec, true);
-        if (llama_decode(ctx_tgt, batch) != 0) {
-            return false;
-        }
-        llama_synchronize(ctx_tgt);
 
         if (timing) {
-            timing->features_decode_ms = 1e-3 * (ggml_time_us() - t_feat);
+            timing->layer_commit_ms = 1e-3 * (ggml_time_us() - t_commit);
+            timing->features_decode_ms = 0;
         }
 
         batch.n_tokens = (int32_t) out_ids.size();
@@ -3464,12 +3541,17 @@ bool common_speculative_dspark_verify_batched(
         return true;
     }
 
+    if (timing) {
+        timing->layer_commit_ms = 0;
+    }
+
     const int64_t t2 = timing ? ggml_time_us() : 0;
 
     if (split_verify) {
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
         dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
 
+        common_speculative_dspark_target_features_enable(spec, true);
         if (llama_decode(ctx_feat, batch) != 0) {
             return false;
         }
@@ -3478,19 +3560,26 @@ bool common_speculative_dspark_verify_batched(
         if (timing) {
             timing->features_decode_ms = 1e-3 * (ggml_time_us() - t2);
         }
-    } else if (timing) {
-        timing->features_decode_ms = 0;
+
+        batch.n_tokens = (int32_t) out_ids.size();
+        const int64_t t3 = timing ? ggml_time_us() : 0;
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
+        if (timing) {
+            timing->process_ms = 1e-3 * (ggml_time_us() - t3);
+        }
+        return true;
     }
 
-    const int64_t t3 = timing ? ggml_time_us() : 0;
-
-    batch.n_tokens = (int32_t) out_ids.size();
-    if (!common_speculative_process(spec, batch)) {
+    const int64_t t_feat = timing ? ggml_time_us() : 0;
+    if (!common_speculative_dspark_process_committed(
+            spec, ctx_tgt, seq_id, pos_verify, anchor, out_ids, batch)) {
         return false;
     }
-
     if (timing) {
-        timing->process_ms = 1e-3 * (ggml_time_us() - (split_verify ? t3 : t2));
+        timing->features_decode_ms = 1e-3 * (ggml_time_us() - t_feat);
+        timing->process_ms         = 0;
     }
 
     return true;

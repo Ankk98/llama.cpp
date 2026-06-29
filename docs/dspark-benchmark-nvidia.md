@@ -170,13 +170,18 @@ Short-prompt DeepSpec reference match **passes on CUDA**.
 
 ### Harness token match vs vanilla
 
-On `code_500l`, spec diverges from vanilla greedy at token 34 despite deterministic reruns (same mismatch index). Possible causes under investigation:
+**Fixed (2026-06-29):** CUDA builds default to sequential target verify inside `verify_batched()` (batched multi-token forward diverged). Compare harness uses aligned full-prompt vanilla prefill on CUDA only (`GGML_USE_CUDA`).
 
-- GPU Markov head + fused block sampler on CUDA (`markov head running on GPU/backend`)
-- Longer-context layer injection / KV numerics on CUDA Q4
-- Prompt-specific draft acceptance path (some prompts match, e.g. `code_fib.json` YES)
+On `code_500l`, n=400, temp=0, RTX 3090:
 
-`DSPARK_NO_BLOCK_GPU=1` did not restore match on `code_500l`. Vulkan reported match YES on the same prompt/weights - backend-specific divergence worth tracking before claiming byte-identical output on all CUDA workloads.
+| Config | Match | tgp speedup |
+|--------|-------|-------------|
+| Default (sequential verify + aligned vanilla) | **YES** | **0.90x** |
+| `DSPARK_VERIFY_BATCHED=1` (batched verify) | NO @ index 54 | ~0.25x |
+
+Vulkan (Strix Halo): batched defer verify + standard vanilla prefill, **YES** n=400, ~1.13x.
+
+Opt-in: `DSPARK_VERIFY_BATCHED=1` (CUDA batched), `DSPARK_VERIFY_DEFER=1` (defer fast path), `DSPARK_PREFILL_DEFER=1` (prefill layer defer).
 
 ---
 
@@ -195,7 +200,8 @@ On `code_500l`, spec diverges from vanilla greedy at token 34 despite determinis
 
 | Date | GPU | Prompt | n | n_max | Speedup | Accept/step | Match | Notes |
 |------|-----|--------|---|-------|---------|-------------|-------|-------|
-| 2026-06-29 | RTX 3090 | code_500l | 400 | 4 | **2.00x** | 2.60 | NO@34 | default fair bench |
+| 2026-06-29 | RTX 3090 | code_500l | 400 | 4 | **0.90x** | ~2.6 | **YES** | sequential verify default |
+| 2026-06-29 | RTX 3090 | code_500l | 400 | 4 | 2.00x | 2.60 | NO@34 | pre-fix batched verify |
 | 2026-06-29 | RTX 3090 | code_fib | 200 | 4 | 1.98x | 2.59 | YES | |
 | 2026-06-29 | RTX 3090 | agentic_plan | 300 | 4 | 1.53x | 1.75 | NO | hits 1.5x target |
 | 2026-06-29 | RTX 3090 | Phase 3a ref | 32 | 7 | - | - | ref OK | smoke pass |
