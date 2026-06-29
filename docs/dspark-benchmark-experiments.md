@@ -1,7 +1,7 @@
 # DSpark benchmark experiments
 
-Living log for DSpark speculative decoding performance work on llama.cpp.
-Hardware, model paths, and command lines are recorded so results can be reproduced and compared.
+Living log for DSpark speculative decoding performance on llama.cpp.
+**Fair methodology only** - numbers below use vanilla-first + 3s cooldown unless noted.
 
 ## Environment
 
@@ -13,169 +13,153 @@ Hardware, model paths, and command lines are recorded so results can be reproduc
 | Backend | Vulkan (`-ngl 99 -ngld 99`) |
 | Harness | `build/bin/compare_vanilla_speculative` |
 | Eval prompts | `/tmp/dspark_eval/*.json` |
-| Bench order | **Speculative first, vanilla last** |
-| Git (latest sweep) | `889ae1063` + local (process sync skip, pp/tgp table) |
+
+### Fair benchmark protocol
+
+1. **Vanilla first** on a cool GPU (baseline not thermally penalized).
+2. **3s cooldown** + KV reset before speculative (`DSPARK_BENCH_NO_COOLDOWN=1` to skip).
+3. **Fixed config** per run (`DSPARK_NO_ADAPTIVE_NMAX=1` for sweeps).
+4. Report **pp** and **tgp** tok/s for both paths plus speedup.
+
+**Do not use spec-first ordering** for headline numbers. Earlier spec-first runs
+inflated speedup by ~10-15% (e.g. 1.77x reported vs **1.57-1.61x fair**).
 
 ### Standard command
 
 ```bash
-./build/bin/compare_vanilla_speculative \
+DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   -m "$TARGET" -md "$DRAFT" \
   --input-ids /tmp/dspark_eval/code_500l.json \
   --spec-type draft-dspark \
   -c 1024 -ngl 99 -ngld 99 --temp 0 --seed 42 \
-  --spec-draft-n-max 3 -n 500
+  --spec-draft-n-max 4 -n 400
 ```
 
 ### Profiling env vars
 
 | Variable | Effect |
 |----------|--------|
-| `DSPARK_PROF=1` | Per-step draft forward vs sampling split in logs |
-| `DSPARK_DEBUG=1` | Per-step anchor/draft/accept trace |
-| `DSPARK_NO_ADAPTIVE_NMAX=1` | Disable hit-rate n_max shrink/expand |
-| `DSPARK_NO_BLOCK_GPU=1` | Force CPU block sampler |
-| `DSPARK_SPLIT_VERIFY=1` | Dual ctx: logits on ctx_tgt, layers on ctx_tgt_feat |
-| `DSPARK_VERIFY_SEQ=1` | Sequential early-exit verify (debug) |
+| `DSPARK_BENCH_NO_COOLDOWN=1` | Skip 3s pause between vanilla and spec |
+| `DSPARK_NO_ADAPTIVE_NMAX=1` | Fixed n_max (required for fair sweeps) |
+| `DSPARK_PROF=1` | Draft forward vs sampling split |
+| `DSPARK_SPLIT_VERIFY=1` | Dual ctx verify (structurally slower; see below) |
 
 ### Reading pp vs tgp
 
 | Metric | Vanilla | Speculative |
 |--------|---------|-------------|
-| **pp** | Target prefill only (`prompt decode`) | Prefill + first-token sample + `process()` setup (~270ms one-time) |
-| **tgp** | Target autoregressive decode | Draft + verify + process loop (**primary metric**) |
+| **pp** | Target prefill only | Prefill + first-token sample + `process()` setup |
+| **tgp** | Target decode loop | Draft + verify + process (**use this for speedup**) |
 
-Spec **pp** is not apples-to-apples with vanilla pp (includes extra setup). Compare **tgp** for generation speedup.
+Spec pp is not comparable to vanilla pp (extra setup). **tgp speedup is the headline metric.**
 
-## First-principles model
+## Critical assessment (2026-06-29)
 
-Per propose step:
+### What is real (structural)
 
-```
-tokens_out = 1 + accepted_drafts   (includes bonus token)
-step_ms    = draft_ms + verify_ms
-ms/token   = step_ms / tokens_out
-speedup    = vanilla_tgp / spec_tgp
-```
+| Change | Fair impact | Notes |
+|--------|-------------|-------|
+| Batched verify + greedy accept fast-path | Large | Core architecture |
+| Shorter draft decode (`n_draft+1`) + per-length `block_gpu` | Moderate | Real GPU savings on draft |
+| `n_max=4` sweet spot | ~same tgp as n_max=3, **token match YES** | Config, not thermal |
+| Process sync skip (short batches) | Noise | <1% |
+| Adaptive n_max | Variance | Disabled for fair runs |
 
-Bottleneck (typical, n_max=3, coding):
+### What is NOT real
 
-| Phase | ms/step | Notes |
-|-------|---------|-------|
-| Draft forward + GPU block sample | ~16 | n_draft+1 tokens, fused block_gpu |
-| Target verify decode + sync | ~108 | 12B Q4 batched forward (4 tokens) + fence |
-| Accept (greedy) | ~1 | Single GPU sync + argmax |
-| process (encode + inject) | ~1 | Not on critical path |
+| Approach | Fair result | Why |
+|----------|-------------|-----|
+| Spec-first bench order | +10-15% fake speedup | Vanilla runs hot |
+| Split verify (dual ctx) | **0.79-1.04x** | 2nd target forward >> layer-tap savings |
+| flash-attn on/off | **neutral** (~1.52-1.58x) | Within variance |
+| ubatch 256-2048 | **neutral** | Within variance |
+| `-c 512` vs `1024` | **neutral** | Within variance |
 
-**Conclusion:** 2x needs ~13% more tgp (1.77x -> 2.0x). Verify batch forward is the ceiling;
-layer-input taps are cheap when bundled in single-pass. Split-verify re-decode loses.
+### Bottleneck (honest)
 
-## Throughput results (2026-06-29)
+Verify step ~110-128 ms/step = **12B Q4 batched forward on 4-5 tokens** + GPU fence.
+`decode_submit_ms` ~2 ms (async return); almost all time is GPU matmul, not CPU or layer D2H.
+Layer-input taps are views on existing forward activations; disabling them via split-verify
+still requires a second forward on committed tokens and loses badly.
 
-All runs: `-c 1024`, `temp=0`, `seed=42`, spec-first / vanilla-last, Vulkan.
+**2x fair tgp is not reachable by config tuning alone.** From fair **~1.61x**, need ~25% more.
+Real paths: faster target batched decode (graph/kernel), or higher acceptance without larger
+verify batches (draft model quality).
 
-### Coding (target 2.0x tgp)
+## Fair throughput results
 
-| Prompt | n | n_max | Config | pp van (tok/s) | pp spec (tok/s) | **tgp van** | **tgp spec** | **Speedup** | Accept/step |
-|--------|---|-------|--------|----------------|-----------------|-------------|--------------|-------------|-------------|
-| code_500l | 500 | 3 | fixed | 16062 | 346* | **25.81** | **45.78** | **1.77x** | 2.18 |
-| code_500l | 600 | 3 | fixed | 25.63 | - | **25.63** | **45.16** | **1.76x** | 2.25 |
-| code_500l | 400 | 3 | fixed | - | - | - | - | **1.72x** | - |
-| code_bug | 286 | 3 | fixed | 22265 | 349* | **25.75** | **40.65** | **1.58x** | 2.38 |
-| code_fib | 78 | 3 | fixed | 6117 | 295* | **25.55** | **39.70** | **1.55x** | 2.29 |
+All: `-c 1024`, `temp=0`, `seed=42`, vanilla-first + 3s cooldown, `DSPARK_NO_ADAPTIVE_NMAX=1`.
 
-\* spec pp includes setup; not comparable to vanilla pp.
+### Coding (`code_500l`, n_predict=400)
 
-**Best coding:** 45.78 tgp vs 25.81 vanilla = **1.77x** (`code_500l`, n=500, n_max=3).
-Peak observed: **1.78x** (n=400, same config, thermal variance).
+| n_max | pp van | tgp van | pp spec* | tgp spec | **Speedup** | Accept/step | Verify ms | Match |
+|-------|--------|---------|----------|----------|-------------|-------------|-----------|-------|
+| **4** | - | **25.48** | - | **41.15** | **1.61x** | 2.50 | 128 | **YES** |
+| 3 | - | 25.58 | - | 40.98 | 1.60x | 2.05 | 111 | NO |
+| 2 | - | 25.64 | - | 39.49 | 1.54x | 1.46 | 93 | NO |
 
-### Agentic (target 1.5x tgp)
+\* spec pp includes one-time setup (~270 ms); not compared here.
 
-| Prompt | n | n_max | Config | tgp van | tgp spec | Speedup | Accept/step |
-|--------|---|-------|--------|---------|----------|---------|-------------|
-| agentic_plan | 400 | 2 | fixed | 25.76 | 36.99 | **1.44x** | 1.25 |
-| agentic_plan | 300 | 2 | fixed | 25.55 | 34.61 | **1.35x** | 1.30 |
-| agentic_plan | 500 | 2 | fixed | - | - | **1.41x** | 1.28 |
-| agentic_plan | 300 | 3 | adaptive | 23.29 | 26.49 | 1.14x | 1.59 |
+**Sweet spot: `n_max=4`** - best fair speedup with greedy token match at temp=0.
 
-**Best agentic:** 36.99 tgp vs 25.76 vanilla = **1.44x** (n_max=2, n=400). Need **38.6 tgp** for 1.5x.
+### Agentic (`agentic_plan`, n_predict=300)
 
-### General / other
+| n_max | tgp van | tgp spec | Speedup | Accept/step | Verify ms | Match |
+|-------|---------|----------|---------|-------------|-----------|-------|
+| 2 | 25.61 | 35.86 | **1.40x** | 1.27 | 94 | NO |
+| 3 | 25.89 | 35.62 | 1.38x | 1.56 | 107 | NO |
 
-| Prompt | n | n_max | tgp van | tgp spec | Speedup | Accept/step | Notes |
-|--------|---|-------|---------|----------|---------|-------------|-------|
-| essay_100w | 114 | 3 | 25.13 | 17.74 | **0.71x** | 1.09 | Low acceptance; spec slower |
+Agentic acceptance ~1.3-1.6/step limits speedup. **1.5x fair target not met** (~7% gap).
 
-### Per-step timing (code_500l, n_max=3, n=500)
+### Config sweeps (fair order, same session - thermal drift between runs)
+
+Long back-to-back sweeps are unreliable. Isolated fair runs above are authoritative.
+
+| Config | Approx fair speedup | Verdict |
+|--------|---------------------|---------|
+| flash-attn on | 1.58x | neutral |
+| flash-attn off | 1.52x | neutral |
+| ubatch=512 | 1.58x | neutral |
+| `-c 512/2048` | ~1.12-1.54x | neutral vs 1024 |
+
+### General prose (`essay_100w`)
+
+Low acceptance (~1.1/step) -> spec **slower** than vanilla. Do not use DSpark for this workload.
+
+## Targets vs fair reality
+
+| Workload | Target | Fair best | tgp van -> spec | Gap |
+|----------|--------|-----------|-----------------|-----|
+| Coding | 2.0x | **1.61x** | 25.5 -> 41.2 tok/s | ~24% |
+| Agentic | 1.5x | **1.40x** | 25.6 -> 35.9 tok/s | ~7% |
+
+A **5-10% structural gain** on coding would mean fair **1.69-1.77x** - not yet achieved.
+
+## Per-step timing (fair, code_500l, n_max=4)
 
 | Phase | ms/step |
 |-------|---------|
 | vanilla forward (1 tok) | ~39 |
-| draft (fwd + sample) | 16 |
-| verify (batched) | 108 |
-| decode submit (async) | ~2 |
+| draft (fwd + GPU sample) | ~19 |
+| verify (batched + sync) | ~128 |
 | process (encode + inject) | ~1 |
 
-## Targets
+## Experiment log
 
-| Workload | Target | Best tgp (van -> spec) | Speedup | Gap |
-|----------|--------|------------------------|---------|-----|
-| Coding | 2.0x | 25.8 -> **45.8** tok/s | **1.77-1.78x** | ~12-13% |
-| Agentic | 1.5x | 25.8 -> **37.0** tok/s | **1.44x** | ~10% |
-| General prose | 1.5x | essay 0.71x | - | low accept |
+| Date | Commit | Change | Fair coding speedup |
+|------|--------|--------|---------------------|
+| 2026-06-29 | 05ecf8a | Batched verify + greedy accept | ~1.5x (early, spec-first) |
+| 2026-06-29 | 5298fbd | Shorter draft blocks + block_gpu | +config |
+| 2026-06-29 | 889ae1063 | Adaptive upscale, profiling | spec-first inflated |
+| 2026-06-29 | bdf0f0308 | pp/tgp table, process sync skip | spec-first inflated |
+| 2026-06-29 | (pending) | **Fair harness** (vanilla-first + cooldown) | **1.61x** honest |
 
-## Experiment log (chronological)
+## Open work (structural only)
 
-### 2026-06-29 - Baseline batched verify (05ecf8a)
-
-| Config | Speedup | Notes |
-|--------|---------|-------|
-| n_max=5, c=1024 | ~1.56-1.60x | Pre-short-draft |
-
-### 2026-06-29 - Shorter draft blocks (5298fbd)
-
-Shorter draft decode (n_draft+1), per-length block_gpu, adaptive shrink.
-
-### 2026-06-29 - Adaptive upscale + profiling (889ae1063)
-
-Adaptive upscale (hit > 65%), `decode_submit_ms`, experiments doc.
-
-### 2026-06-29 - Process sync skip + pp/tgp table
-
-| Change | Result |
-|--------|--------|
-| Skip redundant `llama_synchronize` in process() on verify hot path (n_tokens <= 8) | Coding **1.77x** peak |
-| Adaptive thresholds 0.50 / 0.65 | Agentic n_max=2 > adaptive n_max=3 |
-| Harness prints pp/tgp side-by-side | See throughput tables above |
-
-### Algorithm investigations
-
-| Idea | Result | Notes |
-|------|--------|-------|
-| Shorter draft decode (n_draft+1) | **Win** | Keeps fused block_gpu per length |
-| Split verify (dual ctx) | **Loss** | +47ms feature re-decode/step |
-| Sequential early-exit verify | **Loss** | ~1.4x slower than batched |
-| Cached logits (skip anchor decode) | **Deferred** | KV trim semantics need care |
-| flash-attn on | **Neutral/loss** | No verify improvement |
-| -c 512 | **Minor loss** | 1.62x vs 1.72x |
-
-### n_max sweep (code_500l, n=500, spec-first)
-
-| n_max | Speedup | Accept/step | Verify ms | Draft ms |
-|-------|---------|-------------|-----------|----------|
-| 3 | **1.77x** | 2.18 | 108 | 16 |
-| 4 | 1.67x | 2.67 | 131 | 20 |
-| 5 | 1.47x | 2.91 | 159 | 25 |
-
-**Sweet spot:** n_max=3 for coding.
-
-## Open hypotheses
-
-1. **KV-aware cached logits verify** - skip anchor re-decode when safe (needs KV rewrite on mismatch)
-2. **llama graph** - logits-only verify ctx (never layer taps) + committed-only feature pass without toggle
-3. **Agentic draft quality** - acceptance ~1.3/step is the limiter, not verify ms
-4. **Separate-process bench** - remove thermal skew between spec and vanilla
-5. **Server wiring** of `verify_batched`
+1. **Target verify forward** - llama graph / Vulkan kernel for small batched decode (only path to 2x)
+2. **Agentic acceptance** - draft model / prompt class, not verify ms
+3. **Token match at temp=0** - n_max=4 matches; n_max=3 drifts on Q4 batched path
+4. **Deferred layer D2H** - unlikely >=5% (rejected positions are ~1 row of D2H)
 
 ## How to append results
 
@@ -184,8 +168,9 @@ COMM=$(git rev-parse --short HEAD)
 DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   -m "$TARGET" -md "$DRAFT" --input-ids /tmp/dspark_eval/code_500l.json \
   --spec-type draft-dspark -c 1024 -ngl 99 -ngld 99 --temp 0 --seed 42 \
-  --spec-draft-n-max 3 -n 500 2>&1 | tee /tmp/bench.out
+  --spec-draft-n-max 4 -n 400 2>&1 | tee /tmp/bench.out
 
-grep -E 'throughput|tgp speedup|mean accepted|verify step' /tmp/bench.out
-# Add row to throughput table: date, commit, prompt, n, n_max, pp van/spec, tgp van/spec, speedup
+grep -E 'generated:|throughput|tgp speedup|mean accepted|token match' /tmp/bench.out
 ```
+
+Record: date, commit, prompt, n, n_max, **pp van/spec, tgp van/spec**, speedup, accept/step, match.

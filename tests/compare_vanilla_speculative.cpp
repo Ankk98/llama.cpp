@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 struct run_stats {
@@ -296,8 +297,7 @@ int main(int argc, char ** argv) {
     const bool has_draft = !params.speculative.draft.mparams.path.empty();
     if (has_draft) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
-        // keep params.speculative.draft.n_max from --spec-draft-n-max (default 3)
-        fprintf(stderr, "note: speculative runs before vanilla (thermal: spec gets cooler GPU)\n");
+        // keep params.speculative.draft.n_max from --spec-draft-n-max (default 4)
     }
 
     llama_backend_init();
@@ -358,16 +358,26 @@ int main(int argc, char ** argv) {
     run_stats vanilla {};
     run_stats spec_stats {};
 
+    // Fair order: vanilla first (baseline on cool GPU), then speculative.
+    // Spec-first inflates speedup via thermal throttling on the vanilla pass.
+    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+        return 1;
+    }
+
     if (has_draft) {
+        llama_synchronize(ctx_tgt);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), 0, 0, -1);
+        const int cooldown_s = getenv("DSPARK_BENCH_NO_COOLDOWN") ? 0 : 3;
+        if (cooldown_s > 0) {
+            fprintf(stderr, "note: cooling down %ds before speculative run (DSPARK_BENCH_NO_COOLDOWN=1 to skip)\n",
+                    cooldown_s);
+            sleep((unsigned) cooldown_s);
+        }
+        common_sampler_reset(smpl.get());
         if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
             return 1;
         }
-    }
-
-    common_sampler_reset(smpl.get());
-
-    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
-        return 1;
     }
 
     fprintf(stderr, "\n=== Vanilla (target only) ===\n");
