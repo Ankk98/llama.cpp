@@ -87,6 +87,7 @@ All runs: `-c 1024`, `temp=0`, `seed=42`, spec-first / vanilla-last, Vulkan.
 \* spec pp includes setup; not comparable to vanilla pp.
 
 **Best coding:** 45.78 tgp vs 25.81 vanilla = **1.77x** (`code_500l`, n=500, n_max=3).
+Peak observed: **1.78x** (n=400, same config, thermal variance).
 
 ### Agentic (target 1.5x tgp)
 
@@ -119,7 +120,7 @@ All runs: `-c 1024`, `temp=0`, `seed=42`, spec-first / vanilla-last, Vulkan.
 
 | Workload | Target | Best tgp (van -> spec) | Speedup | Gap |
 |----------|--------|------------------------|---------|-----|
-| Coding | 2.0x | 25.8 -> **45.8** tok/s | **1.77x** | ~13% |
+| Coding | 2.0x | 25.8 -> **45.8** tok/s | **1.77-1.78x** | ~12-13% |
 | Agentic | 1.5x | 25.8 -> **37.0** tok/s | **1.44x** | ~10% |
 | General prose | 1.5x | essay 0.71x | - | low accept |
 
