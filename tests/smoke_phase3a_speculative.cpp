@@ -147,8 +147,9 @@ int main(int argc, char ** argv) {
         common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, false);
     }
     llama_decode(ctx_tgt, prefill);
+    // process() fully prepares ctx_dft (encode + KV injection); decoding the raw prompt
+    // tokens on ctx_dft again double-injects those positions and corrupts the draft cache
     common_speculative_process(spec, prefill);
-    llama_decode(ctx_dft.get(), prefill);
 
     common_speculative_begin(spec, 0, prompt_tgt);
 

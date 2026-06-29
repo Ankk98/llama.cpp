@@ -94,32 +94,40 @@ static int run_speculative(
         run_stats * out) {
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
 
-    llama_token id_last = inp.back();
-    llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
-    int n_past = (int) inp.size() - 1;
+    llama_tokens prompt_tgt(inp.begin(), inp.end());
+    int n_past = (int) inp.size();
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill
-    // batch must be fully formed (llama_batch_get_one leaves those arrays null).
+    // Prefill the FULL prompt and sample the first token from the target, then draft from
+    // it (mirrors DeepSpec). This avoids a cold start where the last prompt token's target
+    // features are not yet injected into ctx_dft on the first draft - that missing context
+    // row makes the draft degenerate (repeat the anchor) for the first few steps.
+    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill batch
+    // must be fully formed (llama_batch_get_one leaves those arrays null).
     llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-    for (size_t i = 0; i + 1 < inp.size(); ++i) {
-        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, false);
+    for (size_t i = 0; i < inp.size(); ++i) {
+        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, i + 1 == inp.size());
     }
-    out->n_prompt = (int) inp.size() - 1;
+    out->n_prompt = (int) inp.size();
     const double tpp = now_ms();
     llama_decode(ctx_tgt, prefill);
     // process() fully prepares ctx_dft (encode + KV injection) for DSpark; decoding the
     // raw prompt tokens on ctx_dft again would collide with the injected positions
     common_speculative_process(spec, prefill);
     common_speculative_begin(spec, 0, prompt_tgt);
+
+    llama_token id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
+    common_sampler_accept(smpl, id_last, true);
     out->pp_ms = now_ms() - tpp;
 
     out->output = inp;
+    out->output.push_back(id_last);
+    out->n_generated++;
     llama_tokens draft;
     const double t0 = now_ms();
 
-    while (out->n_generated < n_predict) {
+    while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
         auto spec_params = params.speculative;
         spec_params.dspark_temp = params.sampling.temp;
         spec_params.dspark_seed = params.sampling.seed;

@@ -143,3 +143,15 @@ struct llama_dspark_spec_cpu {
 };
 
 LLAMA_API bool llama_dspark_spec_cpu_init(const struct llama_model * model, llama_dspark_spec_cpu * out);
+
+// DSpark Markov head evaluated on the backend that holds the markov weights (GPU when the
+// draft is offloaded). The vanilla Markov head is autoregressive (each block position needs
+// the previously sampled token), so it is driven as a per-position matvec dispatch from the
+// CPU sampling loop - this offloads only the heavy markov_w2 @ markov_w1[:, tok] matvec.
+struct llama_dspark_markov_gpu;
+
+LLAMA_API struct llama_dspark_markov_gpu * llama_dspark_markov_gpu_init(const struct llama_model * model);
+LLAMA_API void                             llama_dspark_markov_gpu_free(struct llama_dspark_markov_gpu * h);
+
+// Writes bias[n_vocab] = markov_w2 @ markov_w1[:, prev_token] into out (caller-allocated).
+LLAMA_API bool llama_dspark_markov_gpu_bias(struct llama_dspark_markov_gpu * h, int32_t prev_token, float * out);

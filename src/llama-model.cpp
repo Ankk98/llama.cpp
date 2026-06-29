@@ -2728,7 +2728,22 @@ static bool llama_dspark_tensor_copy_f32(const ggml_tensor * t, std::vector<floa
 
     const size_t n = ggml_nelements(t);
     out.resize(n);
-    ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+        return true;
+    }
+
+    // ggml_backend_tensor_get is a raw byte copy; non-F32 weights (e.g. BF16/quantized) must
+    // be converted to F32 via the type traits, otherwise the markov/confidence heads read garbage
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        return false;
+    }
+
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, ggml_nbytes(t));
+    traits->to_float(raw.data(), out.data(), (int64_t) n);
     return true;
 }
 
@@ -2776,5 +2791,89 @@ bool llama_dspark_spec_cpu_init(const struct llama_model * model, llama_dspark_s
         }
     }
 
+    return true;
+}
+
+struct llama_dspark_markov_gpu {
+    ggml_backend_t   backend = nullptr;
+    ggml_context *   ctx     = nullptr;
+    ggml_gallocr_t   galloc  = nullptr;
+    ggml_cgraph *    gf      = nullptr;
+    ggml_tensor *    inp_tok = nullptr;
+    ggml_tensor *    out_bias = nullptr;
+    int32_t          n_vocab = 0;
+};
+
+llama_dspark_markov_gpu * llama_dspark_markov_gpu_init(const llama_model * model) {
+    if (model == nullptr || model->arch != LLM_ARCH_DSPARK) {
+        return nullptr;
+    }
+    if (model->hparams.markov_rank == 0 || model->markov_w1 == nullptr || model->markov_w2 == nullptr) {
+        return nullptr;
+    }
+
+    auto * h = new llama_dspark_markov_gpu();
+    h->n_vocab = (int32_t) llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // run on the backend that physically holds the markov weights (GPU when offloaded)
+    ggml_backend_dev_t dev = nullptr;
+    if (model->markov_w1->buffer != nullptr) {
+        dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model->markov_w1->buffer));
+    }
+    h->backend = dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_cpu_init();
+    if (h->backend == nullptr) {
+        delete h;
+        return nullptr;
+    }
+
+    // graph context; the markov weights are referenced directly (already allocated on the
+    // backend buffer), so only the input token and intermediates need allocation
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 16 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    h->ctx = ggml_init(ip);
+
+    h->inp_tok = ggml_new_tensor_1d(h->ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(h->inp_tok);
+    ggml_set_name(h->inp_tok, "markov_tok");
+
+    ggml_tensor * latent = ggml_get_rows(h->ctx, model->markov_w1, h->inp_tok); // [rank, 1]
+    latent = ggml_cast(h->ctx, latent, GGML_TYPE_F32);
+    h->out_bias = ggml_mul_mat(h->ctx, model->markov_w2, latent);               // [n_vocab, 1]
+    ggml_set_output(h->out_bias);
+
+    h->gf = ggml_new_graph(h->ctx);
+    ggml_build_forward_expand(h->gf, h->out_bias);
+
+    h->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(h->backend));
+    if (!ggml_gallocr_alloc_graph(h->galloc, h->gf)) {
+        llama_dspark_markov_gpu_free(h);
+        return nullptr;
+    }
+
+    return h;
+}
+
+void llama_dspark_markov_gpu_free(llama_dspark_markov_gpu * h) {
+    if (h == nullptr) {
+        return;
+    }
+    if (h->galloc)  { ggml_gallocr_free(h->galloc); }
+    if (h->ctx)     { ggml_free(h->ctx); }
+    if (h->backend) { ggml_backend_free(h->backend); }
+    delete h;
+}
+
+bool llama_dspark_markov_gpu_bias(llama_dspark_markov_gpu * h, int32_t prev_token, float * out) {
+    if (h == nullptr || out == nullptr) {
+        return false;
+    }
+    ggml_backend_tensor_set(h->inp_tok, &prev_token, 0, sizeof(int32_t));
+    if (ggml_backend_graph_compute(h->backend, h->gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_tensor_get(h->out_bias, out, 0, (size_t) h->n_vocab * sizeof(float));
     return true;
 }

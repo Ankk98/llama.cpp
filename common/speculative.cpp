@@ -1324,6 +1324,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<float> markov_latent;
     std::vector<float> markov_bias;
 
+    llama_dspark_markov_gpu * markov_gpu = nullptr;
+
     std::vector<std::mt19937> rngs;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
@@ -1377,6 +1379,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         if (dspark_w.markov_rank > 0) {
             markov_latent.resize(dspark_w.markov_rank);
             markov_bias.resize(n_vocab);
+
+            // offload the heavy markov_w2 @ markov_w1[:, tok] matvec to the backend that
+            // holds the weights (GPU when offloaded); set DSPARK_MARKOV_CPU=1 to force CPU
+            if (!getenv("DSPARK_MARKOV_CPU")) {
+                markov_gpu = llama_dspark_markov_gpu_init(model_dft);
+                LOG_INF("%s: - markov head running on %s\n", __func__, markov_gpu ? "GPU/backend" : "CPU");
+            }
         }
 
         rngs.resize(n_seq);
@@ -1396,6 +1405,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     ~common_speculative_impl_draft_dspark() override {
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        if (markov_gpu) {
+            llama_dspark_markov_gpu_free(markov_gpu);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1596,7 +1608,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                 if (!disable_markov && dspark_w.markov_rank > 0) {
                     dspark_markov_latent(dspark_w, prev_token, markov_latent.data());
-                    dspark_markov_bias(dspark_w, markov_latent.data(), markov_bias.data());
+                    // heavy markov_w2 @ latent matvec runs on the GPU/backend when available
+                    if (markov_gpu == nullptr ||
+                        !llama_dspark_markov_gpu_bias(markov_gpu, prev_token, markov_bias.data())) {
+                        dspark_markov_bias(dspark_w, markov_latent.data(), markov_bias.data());
+                    }
                     for (int v = 0; v < n_vocab; ++v) {
                         logits_buf[v] += markov_bias[v];
                     }
