@@ -21,6 +21,7 @@ struct run_stats {
     double verify_ms = 0; // time inside target decode + accept + process
     double tgt_decode_ms = 0;
     double verify_accept_ms = 0;
+    double verify_features_ms = 0;
     double verify_process_ms = 0;
     int n_prompt = 0;
     int n_generated = 0;
@@ -104,6 +105,23 @@ static int run_speculative(
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
+    // warmup target graphs (especially after ctx_tgt_feat creation / first split-verify step)
+    {
+        llama_batch warm = llama_batch_init(1, 0, 1);
+        common_batch_add(warm, inp.empty() ? 0 : inp[0], 0, { 0 }, true);
+        llama_decode(ctx_tgt, warm);
+        llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
+        if (ctx_feat) {
+            llama_decode(ctx_feat, warm);
+        }
+        llama_synchronize(ctx_tgt);
+        llama_batch_free(warm);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+        if (ctx_feat) {
+            llama_memory_seq_rm(llama_get_memory(ctx_feat), 0, 0, -1);
+        }
+    }
+
     // Prefill the FULL prompt and sample the first token from the target, then draft from
     // it (mirrors DeepSpec). This avoids a cold start where the last prompt token's target
     // features are not yet injected into ctx_dft on the first draft - that missing context
@@ -116,7 +134,12 @@ static int run_speculative(
     }
     out->n_prompt = (int) inp.size();
     const double tpp = now_ms();
-    llama_decode(ctx_tgt, prefill);
+    llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
+    llama_context * const ctx_prefill = ctx_tgt;
+    llama_decode(ctx_prefill, prefill);
+    if (ctx_feat) {
+        llama_decode(ctx_feat, prefill);
+    }
     common_speculative_process(spec, prefill);
     common_speculative_begin(spec, 0, prompt_tgt);
 
@@ -169,8 +192,9 @@ static int run_speculative(
                 fprintf(stderr, "error: dspark batched verify failed\n");
                 return 1;
             }
-            out->tgt_decode_ms     += vtim.logits_decode_ms;
+            out->tgt_decode_ms     += vtim.logits_decode_ms + vtim.features_decode_ms;
             out->verify_accept_ms  += vtim.accept_ms;
+            out->verify_features_ms += vtim.features_decode_ms;
             out->verify_process_ms += vtim.process_ms;
             out->verify_ms         += vtim.logits_decode_ms + vtim.accept_ms + vtim.process_ms;
         }
@@ -270,7 +294,7 @@ int main(int argc, char ** argv) {
     const bool has_draft = !params.speculative.draft.mparams.path.empty();
     if (has_draft) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
-        params.speculative.draft.n_max = 7;
+        params.speculative.draft.n_max = 5;
     }
 
     llama_backend_init();
@@ -281,6 +305,7 @@ int main(int argc, char ** argv) {
 
     llama_model_ptr model_dft;
     llama_context_ptr ctx_dft;
+    llama_context_ptr ctx_tgt_feat;
     common_speculative * spec = nullptr;
 
     if (has_draft) {
@@ -302,6 +327,18 @@ int main(int argc, char ** argv) {
         ctx_dft.reset(llama_init_from_model(model_dft.get(), common_context_params_to_llama(params_dft)));
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = ctx_dft.get();
+        if (!getenv("DSPARK_NO_SPLIT_VERIFY") && getenv("DSPARK_SPLIT_VERIFY")) {
+            llama_context_params cparams_feat = common_context_params_to_llama(params);
+            cparams_feat.ctx_other = ctx_tgt;
+            ctx_tgt_feat.reset(llama_init_from_model(
+                        const_cast<llama_model *>(llama_get_model(ctx_tgt)), cparams_feat));
+            if (!ctx_tgt_feat) {
+                fprintf(stderr, "warning: failed to create ctx_tgt_feat; using single-pass verify\n");
+            } else {
+                params.speculative.draft.ctx_tgt_feat = ctx_tgt_feat.get();
+                fprintf(stderr, "note: split target verify enabled (ctx_tgt logits + ctx_tgt_feat layers)\n");
+            }
+        }
         spec = common_speculative_init(params.speculative, 1);
     }
 
@@ -318,16 +355,16 @@ int main(int argc, char ** argv) {
     run_stats vanilla {};
     run_stats spec_stats {};
 
-    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
-        return 1;
-    }
-
-    common_sampler_reset(smpl.get());
-
     if (has_draft) {
         if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
             return 1;
         }
+    }
+
+    common_sampler_reset(smpl.get());
+
+    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+        return 1;
     }
 
     fprintf(stderr, "\n=== Vanilla (target only) ===\n");
@@ -365,10 +402,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "  target forward (vanilla, 1 tok)   : %.2f ms\n", v_fwd);
             fprintf(stderr, "  draft  step (fwd + cpu sampling)  : %.2f ms  (proposes %d)\n", d_step, (int) spec_stats.n_drafted / std::max(1, spec_stats.n_propose_steps));
             fprintf(stderr, "  verify step (batched)            : %.2f ms\n", vf_step);
-            fprintf(stderr, "    target decode (full block)     : %.2f ms\n",
-                    spec_stats.tgt_decode_ms / spec_stats.n_propose_steps);
+            fprintf(stderr, "    logits decode (full block)     : %.2f ms\n",
+                    (spec_stats.tgt_decode_ms - spec_stats.verify_features_ms) / spec_stats.n_propose_steps);
             fprintf(stderr, "    accept (sampling)              : %.2f ms\n",
                     spec_stats.verify_accept_ms / spec_stats.n_propose_steps);
+            fprintf(stderr, "    feature re-decode (committed)  : %.2f ms\n",
+                    spec_stats.verify_features_ms / spec_stats.n_propose_steps);
             fprintf(stderr, "    process (encode + KV inject)   : %.2f ms\n",
                     spec_stats.verify_process_ms / spec_stats.n_propose_steps);
             fprintf(stderr, "  => %.2f ms/propose for %.2f tokens = %.2f ms/token (vanilla %.2f ms/token)\n",

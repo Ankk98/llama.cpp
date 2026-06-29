@@ -334,6 +334,7 @@ struct common_params_speculative_draft {
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_tgt_feat = nullptr; // optional: layer-input extraction (shares KV via ctx_other)
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)

@@ -184,6 +184,9 @@ struct common_speculative_impl {
 
     // DSpark only: toggle target layer-input extraction (expensive; keep off during verify logits)
     virtual void dspark_target_features_enable(bool /*enable*/) {}
+
+    // DSpark only: optional second target context for layer-input extraction (shared KV)
+    virtual llama_context * dspark_ctx_tgt_feat() { return nullptr; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1335,6 +1338,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
     std::vector<std::mt19937> rngs;
 
+    llama_context * ctx_layers() const {
+        return params.ctx_tgt_feat ? params.ctx_tgt_feat : params.ctx_tgt;
+    }
+
     // optional profiling (DSPARK_PROF=1): splits each propose into draft-forward vs CPU-sampling
     bool    prof           = false;
     int64_t prof_decode_us = 0;
@@ -1416,8 +1423,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             rng.seed(seed);
         }
 
+        if (this->params.ctx_tgt_feat) {
+            LOG_INF("%s: - split target verify: logits on ctx_tgt, layer features on ctx_tgt_feat (shared KV)\n", __func__);
+        }
+
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            llama_set_embeddings_layer_inp(ctx_layers(), (uint32_t) target_layer_ids[k], true);
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1488,6 +1499,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+        auto * ctx_l    = ctx_layers();
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
@@ -1501,8 +1513,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                llama_synchronize(ctx_l);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = llama_get_embeddings_layer_inp_no_sync(ctx_l, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DSpark: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1787,10 +1800,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     void dspark_target_features_enable(bool enable) override {
-        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_l = ctx_layers();
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], enable);
+            llama_set_embeddings_layer_inp(ctx_l, (uint32_t) target_layer_ids[k], enable);
         }
+    }
+
+    llama_context * dspark_ctx_tgt_feat() override {
+        return params.ctx_tgt_feat;
     }
 
     void sync_params(const common_params_speculative & params) override {
@@ -3191,8 +3208,9 @@ bool common_speculative_dspark_process_committed(
     return common_speculative_process(spec, batch);
 }
 
-// Batched verify: one target forward for the full draft block (layer features stay enabled to
-// avoid per-step graph realloc from toggling), accept, then process() only on the committed prefix.
+// Batched verify: one logits target forward, accept, then process() on the committed prefix.
+// When ctx_tgt_feat is set (shared KV, layer outputs only on ctx_feat), the verify logits
+// path avoids 5x layer-input extraction on the full draft block.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
@@ -3212,6 +3230,15 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
+    llama_context * ctx_feat = nullptr;
+    for (auto & impl : spec->impls) {
+        if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
+            ctx_feat = f;
+        }
+    }
+
+    const bool split_verify = ctx_feat != nullptr && getenv("DSPARK_NO_SPLIT_VERIFY") == nullptr;
+
     common_batch_clear(batch);
     common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
     for (size_t i = 0; i < draft.size(); ++i) {
@@ -3226,8 +3253,7 @@ bool common_speculative_dspark_verify_batched(
     llama_synchronize(ctx_tgt);
 
     if (timing) {
-        timing->logits_decode_ms   = 1e-3 * (ggml_time_us() - t0);
-        timing->features_decode_ms = 0;
+        timing->logits_decode_ms = 1e-3 * (ggml_time_us() - t0);
     }
 
     const int64_t t1 = timing ? ggml_time_us() : 0;
@@ -3253,13 +3279,31 @@ bool common_speculative_dspark_verify_batched(
 
     const int64_t t2 = timing ? ggml_time_us() : 0;
 
+    if (split_verify) {
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
+
+        if (llama_decode(ctx_feat, batch) != 0) {
+            return false;
+        }
+        llama_synchronize(ctx_feat);
+
+        if (timing) {
+            timing->features_decode_ms = 1e-3 * (ggml_time_us() - t2);
+        }
+    } else if (timing) {
+        timing->features_decode_ms = 0;
+    }
+
+    const int64_t t3 = timing ? ggml_time_us() : 0;
+
     batch.n_tokens = (int32_t) out_ids.size();
     if (!common_speculative_process(spec, batch)) {
         return false;
     }
 
     if (timing) {
-        timing->process_ms = 1e-3 * (ggml_time_us() - t2);
+        timing->process_ms = 1e-3 * (ggml_time_us() - (split_verify ? t3 : t2));
     }
 
     return true;

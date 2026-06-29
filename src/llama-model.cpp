@@ -2211,6 +2211,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        llama_memory_t mem_other = nullptr;
+                        if (cparams.ctx_other) {
+                            mem_other = llama_get_memory(cparams.ctx_other);
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2224,9 +2229,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
-                                nullptr,
+                                mem_other,
                                 filter,
-                                nullptr,
+                                reuse,
                                 nullptr);
                     }
                 }

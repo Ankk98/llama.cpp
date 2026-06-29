@@ -3734,6 +3734,10 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
+    return llama_get_embeddings_layer_inp_no_sync(ctx, lid);
+}
+
+float * llama_get_embeddings_layer_inp_no_sync(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp(lid);
 }
 
