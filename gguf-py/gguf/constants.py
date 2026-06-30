@@ -163,6 +163,7 @@ class Keys:
         MARKOV_HEAD_TYPE                  = "{arch}.markov_head_type"
         ENABLE_CONFIDENCE_HEAD            = "{arch}.enable_confidence_head"
         CONFIDENCE_HEAD_WITH_MARKOV       = "{arch}.confidence_head_with_markov"
+        ATTENTION_K_EQ_V                  = "{arch}.attention_k_eq_v"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -4227,6 +4228,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.FFN_PRE_NORM,
         MODEL_TENSOR.FFN_POST_NORM,

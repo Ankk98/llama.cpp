@@ -961,6 +961,9 @@ class GGUFWriter:
     def add_confidence_head_with_markov(self, value: bool) -> None:
         self.add_bool(Keys.LLM.CONFIDENCE_HEAD_WITH_MARKOV.format(arch=self.arch), value)
 
+    def add_attention_k_eq_v(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.ATTENTION_K_EQ_V.format(arch=self.arch), value)
+
     def add_target_hidden_size(self, value: int) -> None:
         self.add_uint32(Keys.LLM.TARGET_HIDDEN_SIZE.format(arch=self.arch), value)
 

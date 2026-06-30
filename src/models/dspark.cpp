@@ -7,7 +7,12 @@ void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
-    hparams.f_attention_scale = 1.0f;
+    hparams.dspark_attention_k_eq_v = true;
+    ml.get_key(LLM_KV_ATTENTION_K_EQ_V, hparams.dspark_attention_k_eq_v, false);
+
+    if (hparams.dspark_attention_k_eq_v) {
+        hparams.f_attention_scale = 1.0f;
+    }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DSpark model requires 'target_layers' in GGUF metadata");
@@ -80,14 +85,15 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader &) {
 
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa },
+            hparams.dspark_attention_k_eq_v ? TENSOR_NOT_REQUIRED : 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
-        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, 0);
-        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, 0);
+        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
+        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
         layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,    "weight", i), { n_embd, n_ff }, 0);
         layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,    "weight", i), { n_ff, n_embd }, 0);
         layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff }, 0);
@@ -95,8 +101,11 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader &) {
         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1u }, TENSOR_NOT_REQUIRED);
 
         if (!hparams.is_swa(i)) {
-            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head_k/2 }, rope_freqs_flag);
-            rope_freqs_flag = TENSOR_DUPLICATED;
+            const int rope_flag = hparams.dspark_attention_k_eq_v ? rope_freqs_flag : TENSOR_NOT_REQUIRED;
+            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head_k/2 }, rope_flag);
+            if (hparams.dspark_attention_k_eq_v) {
+                rope_freqs_flag = TENSOR_DUPLICATED;
+            }
         }
     }
 }
@@ -162,7 +171,10 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
         inp_attn = build_attn_inp_kv();
     }
 
-    const float kq_scale = hparams.f_attention_scale;
+    const bool k_eq_v = hparams.dspark_attention_k_eq_v;
+    const float kq_scale = k_eq_v
+        ? hparams.f_attention_scale
+        : 1.0f / sqrtf(float(n_embd_head));
 
     // context K/V injection from fused target features
     if (ubatch.embd) {
@@ -186,13 +198,15 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
             ggml_tensor * freq_factors = hparams.is_swa(il) ? nullptr : layer.rope_freqs;
 
             ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = Kcur;
+            ggml_tensor * Vcur = k_eq_v ? Kcur : build_lora_mm(layer.wv, inp_g);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
             Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
-            Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+            if (k_eq_v) {
+                Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+            }
 
             Kcur = ggml_rope_ext(
                     ctx0, Kcur, inp_pos, freq_factors,
@@ -230,7 +244,9 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_set_input(inp->tokens);
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
-    inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
+    if (k_eq_v) {
+        inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -251,7 +267,7 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * Qcur = build_lora_mm(layer.wq, h);
         ggml_tensor * Kcur = build_lora_mm(layer.wk, h);
-        ggml_tensor * Vcur = Kcur;
+        ggml_tensor * Vcur = k_eq_v ? Kcur : build_lora_mm(layer.wv, h);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -259,7 +275,9 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
-        Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+        if (k_eq_v) {
+            Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+        }
 
         Qcur = ggml_rope_ext(
                 ctx0, Qcur, inp_pos, freq_factors,
@@ -279,34 +297,55 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
             ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
             : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
-        cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "attn_post_norm", il);
+        if (k_eq_v) {
+            cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "attn_post_norm", il);
 
-        inpL = ggml_add(ctx0, cur, residual);
-        cb(inpL, "attn_out", il);
+            inpL = ggml_add(ctx0, cur, residual);
+            cb(inpL, "attn_out", il);
 
-        residual = inpL;
+            residual = inpL;
 
-        h = build_norm(inpL, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
-        cb(h, "ffn_norm", il);
+            h = build_norm(inpL, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+            cb(h, "ffn_norm", il);
 
-        cur = build_ffn(h,
-                layer.ffn_up,   NULL, NULL,
-                layer.ffn_gate, NULL, NULL,
-                layer.ffn_down, NULL, NULL,
-                NULL,
-                LLM_FFN_GELU, LLM_FFN_PAR, il);
-        cb(cur, "ffn_out", il);
+            cur = build_ffn(h,
+                    layer.ffn_up,   NULL, NULL,
+                    layer.ffn_gate, NULL, NULL,
+                    layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+            cb(cur, "ffn_out", il);
 
-        cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "ffn_post_norm", il);
+            cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "ffn_post_norm", il);
 
-        inpL = ggml_add(ctx0, cur, residual);
-        cb(inpL, "l_out", il);
+            inpL = ggml_add(ctx0, cur, residual);
+            cb(inpL, "l_out", il);
 
-        if (layer.out_scale) {
-            inpL = ggml_mul(ctx0, inpL, layer.out_scale);
-            cb(inpL, "out_scaled", il);
+            if (layer.out_scale) {
+                inpL = ggml_mul(ctx0, inpL, layer.out_scale);
+                cb(inpL, "out_scaled", il);
+            }
+        } else {
+            inpL = ggml_add(ctx0, cur, residual);
+            cb(inpL, "attn_out", il);
+
+            residual = inpL;
+
+            h = build_norm(inpL, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
+            cb(h, "post_attn_norm", il);
+
+            cur = build_ffn(h,
+                    layer.ffn_up,   NULL, NULL,
+                    layer.ffn_gate, NULL, NULL,
+                    layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(cur, "ffn_out", il);
+
+            inpL = ggml_add(ctx0, cur, residual);
+            cb(inpL, "l_out", il);
         }
     }
 
