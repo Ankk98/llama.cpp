@@ -19,9 +19,9 @@ Related docs:
 | Greedy verify correctness | Fixed. Parallel multi-row accept was wrong semantics at `temp=0`. Default is now sequential one-token decode. |
 | Post-fix spot checks (`n=200`, `c=8096`, `conf=0`, `n_max=4`) | `code01_think_off` YES, `agent03_think_on` YES, `code_500l` YES |
 | Known remaining mismatch | None on post-fix spot checks (incl. `code01_think_on` @ n=199) |
-| Full 20-prompt suite | **Not re-run post-fix.** Pre-fix run (`3b6d47010`) had **37.5% token match** (75/200 DSpark rows). Stale until regenerated. |
+| Full 20-prompt suite (`conf=0`, n=200, commit `5bb81fc79`) | **40/40 token match YES** (100%) |
 
-**Bottom line:** Greedy verify uses scratch parallel logits + canonical commit. Token match YES on spot checks. Full 20-prompt suite still needs re-run for baseline.
+**Bottom line:** Greedy verify uses scratch parallel logits + canonical commit. Full suite passes at `conf=0` after `n_parallel=2` on vanilla reference runs + `memory_clear` between combined runs.
 
 ---
 
@@ -143,9 +143,11 @@ Higher threshold raises per-token acceptance but forces full-block draft forward
 
 | # | Task | Details | Done when |
 |---|------|---------|-----------|
-| 1 | **Re-run full 20-prompt suite** | Regenerate baseline after KV reset + parallel verify fix | 200/200 token match YES at `conf=0` |
-| 2 | ~~Fix `code01_think_on` gen-198 mismatch~~ | **Done:** harness `llama_memory_clear` between vanilla/spec runs | - |
-| 3 | **Add CI/canary token-match gate** | Quick harness on 4-5 prompts with `DSPARK_KV_ASSERT=1` | Fails build on token mismatch |
+| # | Task | Status |
+|---|------|--------|
+| 1 | **Re-run full 20-prompt suite** | **Done:** 40/40 match @ `conf=0` (100%) |
+| 2 | ~~Fix `code01_think_on` gen-198 mismatch~~ | **Done:** `memory_clear` + `n_parallel=2` on vanilla refs |
+| 3 | **Add CI/canary token-match gate** | Pending |
 
 ### P1 - Performance (correct verify that beats vanilla)
 

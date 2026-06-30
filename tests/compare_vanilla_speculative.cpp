@@ -744,7 +744,14 @@ int main(int argc, char ** argv) {
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
-    if (use_dspark_spec && params.n_parallel < 2) {
+    // Scratch verify uses seq_id+1; vanilla reference must use the same n_parallel as spec.
+    if (getenv("DSPARK_BENCH_NPARALLEL")) {
+        const int bench_np = atoi(getenv("DSPARK_BENCH_NPARALLEL"));
+        if (bench_np > 0 && params.n_parallel < bench_np) {
+            fprintf(stderr, "note: benchmark ctx uses n_parallel=%d (DSPARK_BENCH_NPARALLEL)\n", bench_np);
+            params.n_parallel = bench_np;
+        }
+    } else if (use_dspark_spec && params.n_parallel < 2) {
         fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
         params.n_parallel = 2;
     }

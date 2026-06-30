@@ -93,6 +93,34 @@ def git_commit(root: Path) -> str:
         return "unknown"
 
 
+# Debug toggles left in the shell must not leak into benchmark runs.
+_HARNESS_DEBUG_ENV = (
+    "DSPARK_DEBUG",
+    "DSPARK_KV_ASSERT",
+    "DSPARK_NO_BEGIN",
+    "DSPARK_NO_DRAFT",
+    "DSPARK_NO_KV_TRIM",
+    "DSPARK_NO_PREFILL_PROCESS",
+    "DSPARK_NO_SPLIT_VERIFY",
+    "DSPARK_NO_WARMUP",
+    "DSPARK_TRACE_KV",
+    "DSPARK_TRACE_ORACLE",
+    "DSPARK_TRACE_VERIFY",
+    "DSPARK_VANILLA_VERIFY",
+)
+
+
+def harness_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in _HARNESS_DEBUG_ENV:
+        env.pop(key, None)
+    env["DSPARK_NO_ADAPTIVE_NMAX"] = "1"
+    env["DSPARK_BENCH_NPARALLEL"] = "2"
+    if extra:
+        env.update(extra)
+    return env
+
+
 def append_csv_row(csv_path: Path, row: dict[str, object]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
@@ -134,6 +162,7 @@ def run_harness(
     env: dict[str, str],
     extra_args: list[str],
 ) -> tuple[int, dict | None]:
+    bench_np = env.get("DSPARK_BENCH_NPARALLEL")
     cmd = [
         str(compare_bin),
         "-m",
@@ -161,6 +190,8 @@ def run_harness(
         "--dspark-confidence-threshold",
         str(confidence),
     ]
+    if bench_np:
+        cmd.extend(["-np", bench_np])
     if draft:
         cmd.extend(["-md", draft, "-ngld", "99"])
     if vanilla_only:
@@ -378,10 +409,10 @@ def main() -> int:
         args.confidence = [0.0]
 
     commit = git_commit(root)
-    env = os.environ.copy()
-    env["DSPARK_NO_ADAPTIVE_NMAX"] = "1"
+    bench_extra: dict[str, str] = {}
     if args.no_cooldown:
-        env["DSPARK_BENCH_NO_COOLDOWN"] = "1"
+        bench_extra["DSPARK_BENCH_NO_COOLDOWN"] = "1"
+    env = harness_env(bench_extra)
 
     vanilla_cache: dict[str, dict] = {}
 

@@ -29,7 +29,8 @@ Gemma4 reference numbers: [dspark-benchmark-experiments.md](dspark-benchmark-exp
 - **Default:** scratch parallel verify (logits on seq+1, commit on canonical seq 0).
 - **Sequential fallback:** `DSPARK_VERIFY_SEQ=1`.
 - **Between-run reset:** `llama_memory_clear(..., true)` - `seq_rm` alone leaves stale K/V bytes and caused false mismatches (e.g. `code01_think_on` in combined harness).
-- **Debug:** `DSPARK_KV_ASSERT=1` asserts canonical `kv_max == pos_verify - 1` across verify/commit.
+- **Harness fix:** vanilla Vulkan prefill now matches spec (full prompt + first-token sample).
+- **Benchmark:** all runs use `-np 2` via `DSPARK_BENCH_NPARALLEL=2` so vanilla references match spec KV layout.
 
 ---
 
@@ -309,7 +310,30 @@ canonical target KV. Requires `n_parallel >= 2` when parallel verify is enabled.
 
 Debug: `DSPARK_TRACE_KV=1`, `DSPARK_VERIFY_SEQ=1` (alias for sequential).
 
-### Post-fix validation (Vulkan Q4, n=200, c=8096, temp=0, parallel scratch verify)
+## 2026-07-01: Full suite baseline (`conf=0`, parallel scratch verify)
+
+**Commit:** `5bb81fc79` + harness `n_parallel=2` fix for vanilla reference runs.
+
+**Command:** `python3 scripts/dspark-bench-qwen3.py --no-cooldown --confidence 0.0`
+
+| Metric | Value |
+|--------|-------|
+| Token match | **40/40 (100%)** |
+| Mean tgp speedup | **1.01x** |
+| Code speedup | 0.995x (20/20 match) |
+| Agentic speedup | 1.022x (20/20 match) |
+| Accept rate (mean) | ~49% |
+| Mean accept/step | ~2.0 |
+
+**Harness fixes required for zero mismatches:**
+1. `llama_memory_clear(..., true)` between vanilla and spec in combined runs (`seq_rm` leaves stale K/V).
+2. **`-np 2` on vanilla-only runs** - scratch verify uses seq 1; vanilla reference at `n_parallel=1` diverges.
+
+Benchmark script sets `DSPARK_BENCH_NPARALLEL=2` and passes `-np 2` to all harness invocations.
+
+---
+
+### Post-fix validation (Vulkan Q4, spot checks)
 
 | Prompt | Token match | tgp speedup |
 |--------|-------------|-------------|
