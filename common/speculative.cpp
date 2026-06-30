@@ -3422,24 +3422,24 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
-    // Greedy default: sequential verify (matches vanilla longer than batched on Vulkan).
-    // Fast batched/defer paths: DSPARK_VERIFY_FAST=1. Explicit override: DSPARK_VERIFY_SEQ=1.
-    if (getenv("DSPARK_VERIFY_FAST") == nullptr && (draft_probs == nullptr || draft_probs->empty())) {
-        return common_speculative_dspark_verify_sequential(
-                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-    }
-
+    // Verify path selection:
+    // - CUDA temp=0: sequential default (batched diverges on long runs); opt-in fast via
+    //   DSPARK_VERIFY_FAST_FORCE=1.
+    // - Vulkan/CPU temp=0: batched defer default (faster; token match YES on Gemma4/Qwen3).
+    // - DSPARK_VERIFY_SEQ=1 forces sequential everywhere.
+    const bool no_draft_probs = draft_probs == nullptr || draft_probs->empty();
+    if (no_draft_probs) {
+        if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
+            return common_speculative_dspark_verify_sequential(
+                    spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+        }
 #if defined(GGML_USE_CUDA)
-    // CUDA multi-token verify logits diverge from the sequential chain (row > 0) on
-    // Gemma4/DSpark; batched fast path breaks token match by ~gen 8. Force sequential
-    // unless explicitly overridden (DSPARK_VERIFY_FAST_FORCE=1).
-    if (getenv("DSPARK_VERIFY_FAST") != nullptr
-            && getenv("DSPARK_VERIFY_FAST_FORCE") == nullptr
-            && (draft_probs == nullptr || draft_probs->empty())) {
-        return common_speculative_dspark_verify_sequential(
-                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-    }
+        if (getenv("DSPARK_VERIFY_FAST_FORCE") == nullptr) {
+            return common_speculative_dspark_verify_sequential(
+                    spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+        }
 #endif
+    }
 
     // Fast paths below (defer / split verify) are opt-in via DSPARK_VERIFY_FAST=1.
     llama_context * ctx_feat = nullptr;

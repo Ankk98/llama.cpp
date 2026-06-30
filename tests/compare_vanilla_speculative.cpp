@@ -59,9 +59,9 @@ static int run_vanilla(
 
     llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-#if defined(GGML_USE_CUDA)
-    // Match spec KV layout: full-prompt prefill + first-token sample (CUDA vanilla
-    // single-token prefill diverges from spec verify around gen index 34).
+    // Match spec KV layout: full-prompt prefill + first-token sample. The old
+    // inp.size()-1 prefill diverged from DSpark spec verify on Vulkan (e.g. Qwen3
+    // agentic mismatch around gen 78).
     llama_token id_last = inp.back();
     int n_past = (int) inp.size();
 
@@ -81,19 +81,6 @@ static int run_vanilla(
     out->output = inp;
     out->output.push_back(id_last);
     out->n_generated = 1;
-#else
-    llama_token id_last = inp.back();
-    int n_past = (int) inp.size() - 1;
-
-    llama_batch prefill = llama_batch_get_one(inp.data(), (int) inp.size() - 1);
-    out->n_prompt = (int) inp.size() - 1;
-    const double tpp = now_ms();
-    llama_decode(ctx_tgt, prefill);
-    out->pp_ms = now_ms() - tpp;
-
-    out->output = inp;
-    out->n_generated = 0;
-#endif
 
     const double t0 = now_ms();
 
