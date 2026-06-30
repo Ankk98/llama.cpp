@@ -106,24 +106,14 @@ Keep threshold `0` for throughput on Vulkan Q4.
 # Generate 20 prompts x thinking on/off token fixtures
 python3 scripts/gen_qwen3_eval_fixtures.py
 
-# Full benchmark: vanilla | MTP (if model has mtp-*.gguf) | DSpark
-# Default -c 8096 (never full trained ctx; Qwen3-8B trained ctx is 40960)
+# Full benchmark: vanilla vs DSpark (default -c 8096, not full trained ctx)
 python3 scripts/dspark-bench-qwen3.py --no-cooldown
 
 # Quick smoke (2 prompts/category, n=64)
-python3 scripts/dspark-bench-qwen3.py --quick --no-cooldown --modes vanilla dspark
+python3 scripts/dspark-bench-qwen3.py --quick --no-cooldown
 ```
 
-### Decode modes
-
-| Mode | Description |
-|------|-------------|
-| `vanilla` | Target only |
-| `mtp` | Target + inbuilt MTP head (`--spec-type draft-mtp`, needs `mtp-*.gguf`) |
-| `dspark` | Target + external DSpark draft |
-
-**Qwen3-8B:** no inbuilt MTP (`nextn_predict_layers=0`). MTP mode is skipped automatically.
-MTP applies to **Qwen3.5+** (and Gemma4, Step35, etc.) with a separate `mtp-*.gguf` head.
+Qwen3-8B has no inbuilt MTP (`nextn_predict_layers=0`). This suite compares **vanilla** vs **DSpark** only.
 
 Results append to `scripts/dspark-vps/eval/qwen3/results.csv` (flushed per row).
 Vanilla expected outputs: `scripts/dspark-vps/eval/qwen3/expected/`.
@@ -132,15 +122,11 @@ Vanilla expected outputs: `scripts/dspark-vps/eval/qwen3/expected/`.
 TARGET=~/models/Qwen3-8B-Q4_K_M.gguf
 DRAFT=~/models/dspark_qwen3_8b_block7.q4_k_m.gguf
 
-# Fair coding headline (target 1.5-2x)
 DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
   -m "$TARGET" -md "$DRAFT" \
   --input-ids scripts/dspark-vps/eval/qwen3/code_500l.json \
-  --spec-type draft-dspark -c 512 --device Vulkan0 -ngl 99 -ngld 99 \
+  --spec-type draft-dspark -c 8096 --device Vulkan0 -ngl 99 -ngld 99 \
   --temp 0 --seed 42 --spec-draft-n-max 4 -n 400
-
-# Quick iteration (skip cooldown)
-DSPARK_NO_ADAPTIVE_NMAX=1 DSPARK_BENCH_NO_COOLDOWN=1 ./build/bin/compare_vanilla_speculative ...
 ```
 
 ---
