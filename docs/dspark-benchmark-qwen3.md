@@ -252,6 +252,86 @@ before `draft_model_path` and other fields were added). Use per-run JSON in
 
 ---
 
+## 2026-06-30: Token match investigation (why spec != vanilla?)
+
+### Your mental model is correct
+
+The **draft model does not define the output**. It only proposes candidate
+tokens. The **target model verify step** decides what gets committed:
+
+- At `temp=0`, verify should greedy-argmax the target logits at each position.
+- Wrong draft tokens should be **rejected**; the target's token is committed
+  instead.
+- If verify is correct, **spec output must equal vanilla target-only output**
+  token-for-token, regardless of draft quality.
+
+So mismatches are a **verify / KV / sampling correctness bug**, not "the draft
+guessed wrong."
+
+### Root cause (confirmed): target KV corruption from batched verify
+
+Batched verify does two things vanilla never does:
+
+1. **Parallel target forward** - one `llama_decode()` with `[anchor, draft...]`
+   to read multi-row logits in one graph.
+2. **Writes draft positions into target KV**, then `llama_memory_seq_rm()` drops
+   rejected tail **metadata only** (K/V tensor bytes in freed cells are not zeroed).
+
+Stale K/V in reused cells corrupts attention over ~100+ steps. Batched row logits
+then diverge from vanilla even though matmul is fine on a clean snapshot.
+
+Evidence:
+
+| Test | Result |
+|------|--------|
+| `smoke_batched_logits_repro --step 4` (clean snapshot) | all rows **MATCH** |
+| `DSPARK_VERIFY_PRE_SNAP=1` | token match **YES** |
+| Default batched pre-fix | **NO** (agent03 @ gen 111) |
+| `DSPARK_TRACE_ORACLE` with pre-snap | every step ids match vanilla chain |
+
+Draft KV (`ctx_dft`) is separate; bug is **target** KV not staying canonical.
+
+### Fix (`common_speculative_dspark_verify_batched`)
+
+Batched verify runs parallel logits on a **scratch sequence** (`seq_id + 1`):
+
+1. `llama_memory_seq_cp` copies canonical prefix from main seq to scratch (separate KV stream).
+2. Batched forward writes draft positions **only on scratch**; main seq is untouched.
+3. Accept from multi-row logits; discard scratch tail.
+4. Append accepted tokens on main seq via `process_committed(..., kv_append_only=true)`.
+
+Requires `n_parallel >= 2` (benchmark harness auto-bumps unless `DSPARK_VERIFY_SEQ=1`).
+Falls back to sequential verify when only one slot. `defer_layer_inp_extract` is off
+during scratch batched forward (defer breaks logits on multi-stream caches).
+
+Removed: rolling KV snapshot + full prefix re-decode workaround.
+
+Debug: `DSPARK_TRACE_KV=1`, `DSPARK_VERIFY_SEQ=1` (force sequential).
+
+### Trace tooling
+
+```bash
+DSPARK_TRACE_KV=1           # kv_max before/after rm and trim
+DSPARK_TRACE_VERIFY=1       # batched vs sequential row logits
+DSPARK_TRACE_ORACLE=1       # full accept chain vs vanilla (uses pre-snap)
+build/bin/smoke_batched_logits_repro --step 4 --input-ids ...
+```
+
+### Hypotheses (final)
+
+1. **Stale K/V in freed cells after batched draft tail** - **CONFIRMED**
+2. **Batched matmul wrong with clean KV** - **RULED OUT**
+3. **`defer_layer_inp_extract`** - ~0.15 logit delta, same argmax on clean KV
+4. **Draft confidence at verify** - **RULED OUT** at `conf=0`
+
+### Draft confidence scores (clarification)
+
+The draft model **can** emit per-token confidence logits when
+`confidence_threshold > 0`. They truncate the draft block only. They are **not**
+used in verify and do **not** change which target tokens are accepted.
+
+---
+
 ## Standard commands
 
 ```bash

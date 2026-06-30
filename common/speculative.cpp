@@ -1219,14 +1219,14 @@ static void dspark_warmup_verify_graph(llama_context * ctx, int32_t n_max, llama
 
     const int32_t n_verify = n_max + 1;
 
-    llama_graph_reserve(ctx, (uint32_t) n_verify, 1, (uint32_t) n_verify);
-
     llama_batch warm = llama_batch_init(llama_n_batch(ctx), 0, 1);
     for (int32_t i = 0; i < n_verify; ++i) {
         common_batch_add(warm, 0, (llama_pos) i, { seq_id }, true);
     }
 
-    llama_decode(ctx, warm);
+    if (llama_decode(ctx, warm) != 0) {
+        SPC_WRN("verify graph warmup decode failed (n_verify=%d)\n", n_verify);
+    }
     llama_synchronize(ctx);
     llama_batch_free(warm);
     llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 0, -1);
@@ -3372,16 +3372,18 @@ bool common_speculative_dspark_process_committed(
         llama_pos pos_verify,
         llama_token anchor,
         const llama_tokens & committed_ids,
-        llama_batch & batch) {
+        llama_batch & batch,
+        bool kv_append_only) {
     if (spec == nullptr || committed_ids.empty()) {
         return true;
     }
 
     common_speculative_dspark_target_features_enable(spec, true);
-    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+    if (!kv_append_only) {
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+    }
 
-    // One token per decode to match vanilla KV accumulation (batched re-decode can
-    // diverge on some backends after many steps).
+    // One token per decode to match vanilla KV accumulation.
     for (size_t i = 0; i < committed_ids.size(); ++i) {
         const llama_token tok_in = (i == 0) ? anchor : committed_ids[i - 1];
 
@@ -3400,9 +3402,142 @@ bool common_speculative_dspark_process_committed(
     return true;
 }
 
-// Batched verify entry point. Default path matches server / speculative-simple semantics
-// (batched logits + accept + incremental committed re-decode). Fast defer paths are
-// opt-in via DSPARK_VERIFY_FAST=1; sequential early-exit via DSPARK_VERIFY_SEQ=1.
+static bool dspark_ctx_save_state(llama_context * ctx, std::vector<uint8_t> & buf) {
+    const size_t sz = llama_state_get_size(ctx);
+    buf.resize(sz);
+    return llama_state_get_data(ctx, buf.data(), sz) == sz;
+}
+
+static bool dspark_ctx_restore_state(llama_context * ctx, const std::vector<uint8_t> & buf) {
+    return llama_state_set_data(ctx, buf.data(), buf.size()) == buf.size();
+}
+
+void common_speculative_dspark_verify_kv_canon_reset() {
+    // Legacy no-op: batched verify uses a scratch sequence instead of rolling snapshots.
+}
+
+// Scratch sequence for batched verify logits. Main seq KV stays append-only.
+static llama_seq_id dspark_verify_scratch_seq_id(const llama_context * ctx, llama_seq_id seq_id) {
+    const llama_seq_id scratch = seq_id + 1;
+    if ((uint32_t) scratch < llama_n_seq_max(ctx)) {
+        return scratch;
+    }
+    return seq_id;
+}
+
+// Compare greedy argmax at each batched verify row vs one-token-at-a-time target
+// decode (vanilla-equivalent: no common_speculative_process). Logs the first row
+// where batched logits disagree; set DSPARK_TRACE_VERIFY=1 to enable.
+static void dspark_trace_batched_vs_sequential_logits(
+        common_speculative * spec,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_batch & batch,
+        const std::vector<uint8_t> & pre_verify_snap,
+        bool defer_layers,
+        int step,
+        int gen_index) {
+    const llama_model * model = llama_get_model(ctx_tgt);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const int n_rows  = (int) draft.size() + 1;
+
+    std::vector<llama_token> batched_tok((size_t) n_rows, LLAMA_TOKEN_NULL);
+
+    llama_synchronize(ctx_tgt);
+    for (int row = 0; row < n_rows; ++row) {
+        const float * logits = llama_get_logits_ith_no_sync(ctx_tgt, row);
+        if (!logits) {
+            fprintf(stderr, "DSPARK_TRACE_VERIFY: missing batched logits row %d\n", row);
+            return;
+        }
+        batched_tok[(size_t) row] = common_sampler_greedy_argmax(logits, n_vocab);
+    }
+
+    int first_mismatch_row = -1;
+
+    for (int row = 0; row < n_rows; ++row) {
+        if (!dspark_ctx_restore_state(ctx_tgt, pre_verify_snap)) {
+            fprintf(stderr, "DSPARK_TRACE_VERIFY: restore_state failed\n");
+            return;
+        }
+
+        common_speculative_dspark_target_features_enable(spec, true);
+
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+
+        for (int j = 0; j <= row; ++j) {
+            const llama_token tok_in = (j == 0) ? anchor : draft[(size_t) j - 1];
+            common_batch_clear(batch);
+            common_batch_add(batch, tok_in, pos_verify + (llama_pos) j, { seq_id }, true);
+            if (llama_decode(ctx_tgt, batch) != 0) {
+                fprintf(stderr, "DSPARK_TRACE_VERIFY: sequential decode failed row %d j %d\n",
+                        row, j);
+                return;
+            }
+            llama_synchronize(ctx_tgt);
+        }
+
+        const float * seq_logits = llama_get_logits_ith(ctx_tgt, 0);
+        if (!seq_logits) {
+            return;
+        }
+
+        const llama_token seq_tok = common_sampler_greedy_argmax(seq_logits, n_vocab);
+
+        if (seq_tok != batched_tok[(size_t) row]) {
+            first_mismatch_row = row;
+            float max_abs = 0.0f;
+            if (dspark_ctx_restore_state(ctx_tgt, pre_verify_snap)) {
+                common_speculative_dspark_target_features_enable(spec, true);
+                if (defer_layers) {
+                    llama_set_defer_layer_inp_extract(ctx_tgt, true);
+                }
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+                common_batch_clear(batch);
+                common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_id }, true);
+                }
+                if (llama_decode(ctx_tgt, batch) == 0) {
+                    llama_synchronize(ctx_tgt);
+                    const float * bl = llama_get_logits_ith_no_sync(ctx_tgt, row);
+                    if (bl) {
+                        for (int v = 0; v < n_vocab; ++v) {
+                            max_abs = std::max(max_abs, std::fabs(bl[v] - seq_logits[v]));
+                        }
+                    }
+                }
+                if (defer_layers) {
+                    llama_set_defer_layer_inp_extract(ctx_tgt, false);
+                }
+            }
+
+            fprintf(stderr,
+                    "DSPARK_TRACE_VERIFY: MISMATCH step=%d gen_index=%d pos=%d row=%d "
+                    "sequential=%d batched=%d max_logit_abs_diff=%.6f defer=%d\n",
+                    step, gen_index, (int) pos_verify, row,
+                    (int) seq_tok, (int) batched_tok[(size_t) row], max_abs,
+                    (int) defer_layers);
+            fprintf(stderr, "  anchor=%d draft_n=%zu (common_speculative_dspark_verify_batched)\n",
+                    (int) anchor, draft.size());
+            break;
+        }
+    }
+
+    if (first_mismatch_row < 0 && getenv("DSPARK_TRACE_VERIFY_VERBOSE")) {
+        fprintf(stderr,
+                "DSPARK_TRACE_VERIFY: step=%d gen_index=%d all %d rows match (defer=%d)\n",
+                step, gen_index, n_rows, (int) defer_layers);
+    }
+
+    (void) first_mismatch_row;
+}
+
+// Batched verify: parallel logits on a scratch sequence; main seq KV stays append-only.
+// Sequential early-exit via DSPARK_VERIFY_SEQ=1.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
@@ -3422,32 +3557,24 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
-    // Verify path selection:
-    // - CUDA temp=0: sequential default (batched diverges on long runs); opt-in fast via
-    //   DSPARK_VERIFY_FAST_FORCE=1.
-    // - Vulkan/CPU temp=0: batched defer default (faster; token match YES on Gemma4/Qwen3).
-    // - DSPARK_VERIFY_SEQ=1 forces sequential everywhere.
-    const bool no_draft_probs = draft_probs == nullptr || draft_probs->empty();
-    if (no_draft_probs) {
-        if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
-            return common_speculative_dspark_verify_sequential(
-                    spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-        }
-#if defined(GGML_USE_CUDA)
-        if (getenv("DSPARK_VERIFY_FAST_FORCE") == nullptr) {
-            return common_speculative_dspark_verify_sequential(
-                    spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-        }
-#endif
+    if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
     }
 
-    // Fast paths below (defer / split verify) are opt-in via DSPARK_VERIFY_FAST=1.
+    const llama_seq_id scratch_seq = dspark_verify_scratch_seq_id(ctx_tgt, seq_id);
+    if (scratch_seq == seq_id) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+
     llama_context * ctx_feat = nullptr;
     for (auto & impl : spec->impls) {
         if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
             ctx_feat = f;
         }
     }
+    (void) ctx_feat;
 
     const bool split_verify = ctx_feat != nullptr && getenv("DSPARK_NO_SPLIT_VERIFY") == nullptr;
 
@@ -3455,16 +3582,40 @@ bool common_speculative_dspark_verify_batched(
             || getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
             || getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
 
+    // Defer during scratch batched forward breaks logits/KV sync on multi-stream caches.
     const bool defer_layers = !split_verify && !force_committed
-            && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
+            && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr
+            && getenv("DSPARK_VERIFY_DEFER_SCRATCH") != nullptr;
+
+    std::vector<uint8_t> trace_pre_snap;
+    static int trace_step = 0;
+    const bool trace_verify = getenv("DSPARK_TRACE_VERIFY") != nullptr;
+    if (trace_verify) {
+        if (!dspark_ctx_save_state(ctx_tgt, trace_pre_snap)) {
+            fprintf(stderr, "DSPARK_TRACE_VERIFY: pre-verify save_state failed\n");
+        }
+    }
 
     llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
-    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify, -1);
+
+    if (getenv("DSPARK_TRACE_KV")) {
+        const llama_pos kv_min = llama_memory_seq_pos_min(mem_tgt, seq_id);
+        const llama_pos kv_max = llama_memory_seq_pos_max(mem_tgt, seq_id);
+        fprintf(stderr,
+                "DSPARK_TRACE_KV: pre-verify step=%d pos_verify=%d main kv_min=%d kv_max=%d "
+                "(expect kv_max==pos_verify-1)\n",
+                trace_step + 1, (int) pos_verify, (int) kv_min, (int) kv_max);
+    }
+
+    llama_synchronize(ctx_tgt);
+    llama_memory_seq_rm(mem_tgt, scratch_seq, 0, -1);
+    llama_memory_seq_cp(mem_tgt, seq_id, scratch_seq, -1, -1);
+    llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
 
     common_batch_clear(batch);
-    common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
+    common_batch_add(batch, anchor, pos_verify, { scratch_seq }, true);
     for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_id }, true);
+        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { scratch_seq }, true);
     }
 
     const int64_t t0 = timing ? ggml_time_us() : 0;
@@ -3481,11 +3632,10 @@ bool common_speculative_dspark_verify_batched(
             && getenv("DSPARK_NO_GPU_GREEDY") == nullptr;
 
     if (fused_argmax) {
-        dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, seq_id);
+        dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, scratch_seq);
     }
 
-    // Layer taps must stay enabled during verify decode (same as sequential verify).
-    // Disabling them changes the target graph and breaks greedy token match on CUDA.
+    // Layer taps on during scratch forward (matches sequential verify; logits differ when off).
     common_speculative_dspark_target_features_enable(spec, true);
 
     if (defer_layers) {
@@ -3501,6 +3651,23 @@ bool common_speculative_dspark_verify_batched(
     }
 
     const int64_t t_decode = timing ? ggml_time_us() : 0;
+
+    if (trace_verify && !trace_pre_snap.empty()) {
+        ++trace_step;
+        const char * only_step = getenv("DSPARK_TRACE_VERIFY_STEP");
+        const char * gen_env   = getenv("DSPARK_TRACE_VERIFY_GEN");
+        const int gen_index    = gen_env ? atoi(gen_env) : -1;
+        if (!only_step || trace_step == atoi(only_step)) {
+            std::vector<uint8_t> trace_post_snap;
+            if (dspark_ctx_save_state(ctx_tgt, trace_post_snap)) {
+                dspark_trace_batched_vs_sequential_logits(
+                        spec, ctx_tgt, seq_id, pos_verify, anchor, draft, batch,
+                        trace_pre_snap, defer_layers, trace_step, gen_index);
+                dspark_ctx_restore_state(ctx_tgt, trace_post_snap);
+            }
+        }
+    }
+
     const int64_t t1 = timing ? ggml_time_us() : 0;
 
     if (draft_probs != nullptr && !draft_probs->empty()) {
@@ -3537,77 +3704,36 @@ bool common_speculative_dspark_verify_batched(
         if (defer_layers) {
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
+        llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
         common_speculative_dspark_target_features_enable(spec, true);
         return false;
     }
 
-    // Drop rejected draft tail left in KV by the batched forward; sequential verify
-    // never writes these cells. Keeping them caused CUDA divergence on long runs.
-    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+    if (getenv("DSPARK_TRACE_KV")) {
+        const llama_pos main_max = llama_memory_seq_pos_max(mem_tgt, seq_id);
+        const llama_pos scratch_max = llama_memory_seq_pos_max(mem_tgt, scratch_seq);
+        fprintf(stderr,
+                "DSPARK_TRACE_KV: post-logits main kv_max=%d scratch kv_max=%d "
+                "out_ids_n=%zu\n",
+                (int) main_max, (int) scratch_max, out_ids.size());
+    }
+
+    llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
 
     if (defer_layers) {
-        const int64_t t_commit = timing ? ggml_time_us() : 0;
-
-        llama_commit_layer_inputs(ctx_tgt, out_ids.size());
         llama_set_defer_layer_inp_extract(ctx_tgt, false);
-        common_speculative_dspark_target_features_enable(spec, true);
-
-        if (timing) {
-            timing->layer_commit_ms = 1e-3 * (ggml_time_us() - t_commit);
-            timing->features_decode_ms = 0;
-        }
-
-        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
-        const int64_t t3 = timing ? ggml_time_us() : 0;
-        if (!common_speculative_process(spec, batch)) {
-            return false;
-        }
-        if (timing) {
-            timing->process_ms = 1e-3 * (ggml_time_us() - t3);
-        }
-        return true;
     }
 
-    if (timing) {
-        timing->layer_commit_ms = 0;
-    }
-
-    const int64_t t2 = timing ? ggml_time_us() : 0;
-
-    if (split_verify) {
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
-        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
-
-        common_speculative_dspark_target_features_enable(spec, true);
-        if (llama_decode(ctx_feat, batch) != 0) {
-            return false;
-        }
-        llama_synchronize(ctx_feat);
-
-        if (timing) {
-            timing->features_decode_ms = 1e-3 * (ggml_time_us() - t2);
-        }
-
-        const int64_t t3 = timing ? ggml_time_us() : 0;
-        if (!common_speculative_process(spec, batch)) {
-            return false;
-        }
-        if (timing) {
-            timing->process_ms = 1e-3 * (ggml_time_us() - t3);
-        }
-        return true;
-    }
-
-    const int64_t t_feat = timing ? ggml_time_us() : 0;
-
-    dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
-    const int64_t t3 = timing ? ggml_time_us() : 0;
-    if (!common_speculative_process(spec, batch)) {
+    const int64_t t_rebuild = timing ? ggml_time_us() : 0;
+    if (!common_speculative_dspark_process_committed(
+            spec, ctx_tgt, seq_id, pos_verify, anchor, out_ids, batch, /*kv_append_only=*/ true)) {
         return false;
     }
+
     if (timing) {
-        timing->features_decode_ms = 1e-3 * (ggml_time_us() - t_feat);
-        timing->process_ms         = 1e-3 * (ggml_time_us() - t3);
+        timing->layer_commit_ms    = 0;
+        timing->features_decode_ms = 0;
+        timing->process_ms         = 1e-3 * (ggml_time_us() - t_rebuild);
     }
 
     return true;

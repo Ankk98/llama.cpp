@@ -182,6 +182,50 @@ static double now_ms() {
             clock::now().time_since_epoch()).count();
 }
 
+static bool ctx_save_state(llama_context * ctx, std::vector<uint8_t> & buf) {
+    const size_t sz = llama_state_get_size(ctx);
+    buf.resize(sz);
+    return llama_state_get_data(ctx, buf.data(), sz) == sz;
+}
+
+static bool ctx_restore_state(llama_context * ctx, const std::vector<uint8_t> & buf) {
+    return llama_state_set_data(ctx, buf.data(), buf.size()) == buf.size();
+}
+
+// Vanilla target-only greedy tokens: sequential one-decode-per-token from saved KV.
+static llama_tokens vanilla_oracle_chain(
+        llama_context * ctx_tgt,
+        llama_batch & batch,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        size_t n_tokens) {
+    llama_tokens out;
+    out.reserve(n_tokens);
+
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+
+    llama_token tok_in = anchor;
+    for (size_t i = 0; i < n_tokens; ++i) {
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_in, pos_verify + (llama_pos) i, { seq_id }, true);
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            break;
+        }
+        llama_synchronize(ctx_tgt);
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const float * logits = llama_get_logits_ith(ctx_tgt, 0);
+        if (!logits) {
+            break;
+        }
+        const llama_token id = common_sampler_greedy_argmax(logits, n_vocab);
+        out.push_back(id);
+        tok_in = id;
+    }
+    return out;
+}
+
 static int run_vanilla(
         common_params & params,
         llama_context * ctx_tgt,
@@ -474,6 +518,8 @@ static int run_speculative(
     llama_tokens draft;
     const double t0 = now_ms();
 
+    common_speculative_dspark_verify_kv_canon_reset();
+
     while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
         auto spec_params = params.speculative;
         spec_params.dspark_temp = params.sampling.temp;
@@ -496,6 +542,31 @@ static int run_speculative(
         const llama_pos pos_verify = n_past;
         llama_tokens ids;
         const double tv0 = now_ms();
+
+        std::vector<uint8_t> oracle_snap;
+        const bool trace_oracle = getenv("DSPARK_TRACE_ORACLE") != nullptr;
+        const bool verify_snap  = trace_oracle || getenv("DSPARK_VERIFY_PRE_SNAP") != nullptr;
+        llama_token oracle_tok = LLAMA_TOKEN_NULL;
+        llama_tokens oracle_chain;
+        if (verify_snap) {
+            if (!ctx_save_state(ctx_tgt, oracle_snap)) {
+                fprintf(stderr, "DSPARK_TRACE_ORACLE: save_state failed at step %d\n",
+                        out->n_propose_steps + 1);
+            } else if (trace_oracle) {
+                oracle_chain = vanilla_oracle_chain(
+                        ctx_tgt, batch_tgt, 0, pos_verify, id_last, draft.size() + 1);
+                oracle_tok = oracle_chain.empty() ? LLAMA_TOKEN_NULL : oracle_chain[0];
+            }
+            if (!oracle_snap.empty() && !ctx_restore_state(ctx_tgt, oracle_snap)) {
+                fprintf(stderr, "DSPARK_TRACE_ORACLE: restore failed before verify\n");
+            }
+        }
+
+        if (getenv("DSPARK_TRACE_VERIFY")) {
+            char gen_buf[32];
+            snprintf(gen_buf, sizeof(gen_buf), "%d", out->n_generated);
+            setenv("DSPARK_TRACE_VERIFY_GEN", gen_buf, 1);
+        }
 
         if (getenv("DSPARK_VANILLA_VERIFY")) {
             common_batch_clear(batch_tgt);
@@ -520,6 +591,21 @@ static int run_speculative(
         }
 
         out->verify_ms += now_ms() - tv0;
+
+        if (trace_oracle && !oracle_chain.empty() && !ids.empty()) {
+            const size_t n_cmp = std::min(oracle_chain.size(), ids.size());
+            for (size_t i = 0; i < n_cmp; ++i) {
+                if (ids[i] == oracle_chain[i]) {
+                    continue;
+                }
+                fprintf(stderr,
+                        "DSPARK_TRACE_ORACLE: CHAIN MISMATCH step=%d gen_index=%d "
+                        "pos_verify=%d at ids[%zu]: batched=%d vanilla=%d draft_n=%zu\n",
+                        out->n_propose_steps, out->n_generated, (int) pos_verify,
+                        i, (int) ids[i], (int) oracle_chain[i], draft.size());
+                break;
+            }
+        }
 
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
@@ -648,6 +734,11 @@ int main(int argc, char ** argv) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
+
+    if (use_dspark_spec && params.n_parallel < 2 && getenv("DSPARK_VERIFY_SEQ") == nullptr) {
+        fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
+        params.n_parallel = 2;
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
