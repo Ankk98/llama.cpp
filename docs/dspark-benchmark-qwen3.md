@@ -103,6 +103,21 @@ Keep threshold `0` for throughput on Vulkan Q4.
 ## Standard commands
 
 ```bash
+# Generate 20 prompts x thinking on/off token fixtures
+python3 scripts/gen_qwen3_eval_fixtures.py
+
+# Full benchmark suite (vanilla refs + spec confidence sweep -> streaming CSV)
+python3 scripts/dspark-bench-qwen3.py --no-cooldown
+
+# Quick smoke (2 prompts/category, n=64)
+python3 scripts/dspark-bench-qwen3.py --quick --no-cooldown
+```
+
+Results append to `scripts/dspark-vps/eval/qwen3/results.csv` (flushed per row).
+Vanilla expected outputs: `scripts/dspark-vps/eval/qwen3/expected/`.
+Per-run JSON: `scripts/dspark-vps/eval/qwen3/runs/`.
+
+```bash
 TARGET=~/models/Qwen3-8B-Q4_K_M.gguf
 DRAFT=~/models/dspark_qwen3_8b_block7.q4_k_m.gguf
 

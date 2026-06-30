@@ -1,0 +1,364 @@
+{
+  "prompts": [
+    {
+      "id": "code01",
+      "category": "code",
+      "subtype": "data_structure",
+      "thinking": "off",
+      "input_ids": "code/code01_think_off.json",
+      "prompt_tokens": 43,
+      "text": "Write a Python thread-safe LRU cache with TTL expiry, async get/set, metrics hooks, and pytest tests. Stdlib only, type hints required."
+    },
+    {
+      "id": "code01",
+      "category": "code",
+      "subtype": "data_structure",
+      "thinking": "on",
+      "input_ids": "code/code01_think_on.json",
+      "prompt_tokens": 39,
+      "text": "Write a Python thread-safe LRU cache with TTL expiry, async get/set, metrics hooks, and pytest tests. Stdlib only, type hints required."
+    },
+    {
+      "id": "code02",
+      "category": "code",
+      "subtype": "api",
+      "thinking": "off",
+      "input_ids": "code/code02_think_off.json",
+      "prompt_tokens": 40,
+      "text": "Implement a FastAPI REST service with JWT auth, rate limiting middleware, pydantic models, and OpenAPI docs. Include error handling."
+    },
+    {
+      "id": "code02",
+      "category": "code",
+      "subtype": "api",
+      "thinking": "on",
+      "input_ids": "code/code02_think_on.json",
+      "prompt_tokens": 36,
+      "text": "Implement a FastAPI REST service with JWT auth, rate limiting middleware, pydantic models, and OpenAPI docs. Include error handling."
+    },
+    {
+      "id": "code03",
+      "category": "code",
+      "subtype": "sql",
+      "thinking": "off",
+      "input_ids": "code/code03_think_off.json",
+      "prompt_tokens": 39,
+      "text": "Optimize this SQL query for a 10M-row orders table with indexes. Explain the plan and provide rewritten SQL with comments."
+    },
+    {
+      "id": "code03",
+      "category": "code",
+      "subtype": "sql",
+      "thinking": "on",
+      "input_ids": "code/code03_think_on.json",
+      "prompt_tokens": 35,
+      "text": "Optimize this SQL query for a 10M-row orders table with indexes. Explain the plan and provide rewritten SQL with comments."
+    },
+    {
+      "id": "code04",
+      "category": "code",
+      "subtype": "algorithm",
+      "thinking": "off",
+      "input_ids": "code/code04_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Implement a balanced binary search tree in Python with insert, delete, search, and in-order traversal. Include complexity analysis."
+    },
+    {
+      "id": "code04",
+      "category": "code",
+      "subtype": "algorithm",
+      "thinking": "on",
+      "input_ids": "code/code04_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Implement a balanced binary search tree in Python with insert, delete, search, and in-order traversal. Include complexity analysis."
+    },
+    {
+      "id": "code05",
+      "category": "code",
+      "subtype": "frontend",
+      "thinking": "off",
+      "input_ids": "code/code05_think_off.json",
+      "prompt_tokens": 33,
+      "text": "Create a React TypeScript component for a paginated data table with sorting, filtering, and accessible keyboard navigation."
+    },
+    {
+      "id": "code05",
+      "category": "code",
+      "subtype": "frontend",
+      "thinking": "on",
+      "input_ids": "code/code05_think_on.json",
+      "prompt_tokens": 29,
+      "text": "Create a React TypeScript component for a paginated data table with sorting, filtering, and accessible keyboard navigation."
+    },
+    {
+      "id": "code06",
+      "category": "code",
+      "subtype": "devops",
+      "thinking": "off",
+      "input_ids": "code/code06_think_off.json",
+      "prompt_tokens": 37,
+      "text": "Write a docker-compose stack for postgres, redis, and a worker service with healthchecks, volumes, and env-based config."
+    },
+    {
+      "id": "code06",
+      "category": "code",
+      "subtype": "devops",
+      "thinking": "on",
+      "input_ids": "code/code06_think_on.json",
+      "prompt_tokens": 33,
+      "text": "Write a docker-compose stack for postgres, redis, and a worker service with healthchecks, volumes, and env-based config."
+    },
+    {
+      "id": "code07",
+      "category": "code",
+      "subtype": "testing",
+      "thinking": "off",
+      "input_ids": "code/code07_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Write pytest tests for an async HTTP client wrapper including retries, timeouts, mocked 5xx responses, and concurrency cases."
+    },
+    {
+      "id": "code07",
+      "category": "code",
+      "subtype": "testing",
+      "thinking": "on",
+      "input_ids": "code/code07_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Write pytest tests for an async HTTP client wrapper including retries, timeouts, mocked 5xx responses, and concurrency cases."
+    },
+    {
+      "id": "code08",
+      "category": "code",
+      "subtype": "parser",
+      "thinking": "off",
+      "input_ids": "code/code08_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Implement a recursive descent parser for a tiny expression language (+, -, *, /, parentheses). Return AST and evaluation function."
+    },
+    {
+      "id": "code08",
+      "category": "code",
+      "subtype": "parser",
+      "thinking": "on",
+      "input_ids": "code/code08_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Implement a recursive descent parser for a tiny expression language (+, -, *, /, parentheses). Return AST and evaluation function."
+    },
+    {
+      "id": "code09",
+      "category": "code",
+      "subtype": "graph",
+      "thinking": "off",
+      "input_ids": "code/code09_think_off.json",
+      "prompt_tokens": 33,
+      "text": "Implement BFS and DFS for an unweighted directed graph. Detect cycles and return shortest path between two nodes."
+    },
+    {
+      "id": "code09",
+      "category": "code",
+      "subtype": "graph",
+      "thinking": "on",
+      "input_ids": "code/code09_think_on.json",
+      "prompt_tokens": 29,
+      "text": "Implement BFS and DFS for an unweighted directed graph. Detect cycles and return shortest path between two nodes."
+    },
+    {
+      "id": "code10",
+      "category": "code",
+      "subtype": "cli",
+      "thinking": "off",
+      "input_ids": "code/code10_think_off.json",
+      "prompt_tokens": 34,
+      "text": "Build a Python CLI with argparse subcommands to backup, restore, and list snapshots from a local directory tree."
+    },
+    {
+      "id": "code10",
+      "category": "code",
+      "subtype": "cli",
+      "thinking": "on",
+      "input_ids": "code/code10_think_on.json",
+      "prompt_tokens": 30,
+      "text": "Build a Python CLI with argparse subcommands to backup, restore, and list snapshots from a local directory tree."
+    },
+    {
+      "id": "agent01",
+      "category": "agentic",
+      "subtype": "explore",
+      "thinking": "off",
+      "input_ids": "agentic/agent01_think_off.json",
+      "prompt_tokens": 33,
+      "text": "List the files in the current directory and summarize what this project does. Mention main modules and entry points."
+    },
+    {
+      "id": "agent01",
+      "category": "agentic",
+      "subtype": "explore",
+      "thinking": "on",
+      "input_ids": "agentic/agent01_think_on.json",
+      "prompt_tokens": 29,
+      "text": "List the files in the current directory and summarize what this project does. Mention main modules and entry points."
+    },
+    {
+      "id": "agent02",
+      "category": "agentic",
+      "subtype": "debug_ci",
+      "thinking": "off",
+      "input_ids": "agentic/agent02_think_off.json",
+      "prompt_tokens": 40,
+      "text": "CI is failing on the latest commit. Inspect the repo, identify the failing test, propose a minimal fix, and explain root cause."
+    },
+    {
+      "id": "agent02",
+      "category": "agentic",
+      "subtype": "debug_ci",
+      "thinking": "on",
+      "input_ids": "agentic/agent02_think_on.json",
+      "prompt_tokens": 36,
+      "text": "CI is failing on the latest commit. Inspect the repo, identify the failing test, propose a minimal fix, and explain root cause."
+    },
+    {
+      "id": "agent03",
+      "category": "agentic",
+      "subtype": "refactor",
+      "thinking": "off",
+      "input_ids": "agentic/agent03_think_off.json",
+      "prompt_tokens": 33,
+      "text": "Refactor the authentication module to separate token validation from route handlers. Keep behavior identical and list changed files."
+    },
+    {
+      "id": "agent03",
+      "category": "agentic",
+      "subtype": "refactor",
+      "thinking": "on",
+      "input_ids": "agentic/agent03_think_on.json",
+      "prompt_tokens": 29,
+      "text": "Refactor the authentication module to separate token validation from route handlers. Keep behavior identical and list changed files."
+    },
+    {
+      "id": "agent04",
+      "category": "agentic",
+      "subtype": "observability",
+      "thinking": "off",
+      "input_ids": "agentic/agent04_think_off.json",
+      "prompt_tokens": 33,
+      "text": "Add structured logging and request tracing to the HTTP service. Include correlation IDs and log levels configurable via env."
+    },
+    {
+      "id": "agent04",
+      "category": "agentic",
+      "subtype": "observability",
+      "thinking": "on",
+      "input_ids": "agentic/agent04_think_on.json",
+      "prompt_tokens": 29,
+      "text": "Add structured logging and request tracing to the HTTP service. Include correlation IDs and log levels configurable via env."
+    },
+    {
+      "id": "agent05",
+      "category": "agentic",
+      "subtype": "debug_perf",
+      "thinking": "off",
+      "input_ids": "agentic/agent05_think_off.json",
+      "prompt_tokens": 38,
+      "text": "Users report a memory leak after long runs. Profile likely causes, point to code paths, and suggest a fix with test plan."
+    },
+    {
+      "id": "agent05",
+      "category": "agentic",
+      "subtype": "debug_perf",
+      "thinking": "on",
+      "input_ids": "agentic/agent05_think_on.json",
+      "prompt_tokens": 34,
+      "text": "Users report a memory leak after long runs. Profile likely causes, point to code paths, and suggest a fix with test plan."
+    },
+    {
+      "id": "agent06",
+      "category": "agentic",
+      "subtype": "migration",
+      "thinking": "off",
+      "input_ids": "agentic/agent06_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Write a database migration script from schema v2 to v3 with rollback support. Handle nullable columns and backfill safely."
+    },
+    {
+      "id": "agent06",
+      "category": "agentic",
+      "subtype": "migration",
+      "thinking": "on",
+      "input_ids": "agentic/agent06_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Write a database migration script from schema v2 to v3 with rollback support. Handle nullable columns and backfill safely."
+    },
+    {
+      "id": "agent07",
+      "category": "agentic",
+      "subtype": "review",
+      "thinking": "off",
+      "input_ids": "agentic/agent07_think_off.json",
+      "prompt_tokens": 34,
+      "text": "Review the open pull request changes for security issues, API breakage, and missing tests. Provide actionable comments."
+    },
+    {
+      "id": "agent07",
+      "category": "agentic",
+      "subtype": "review",
+      "thinking": "on",
+      "input_ids": "agentic/agent07_think_on.json",
+      "prompt_tokens": 30,
+      "text": "Review the open pull request changes for security issues, API breakage, and missing tests. Provide actionable comments."
+    },
+    {
+      "id": "agent08",
+      "category": "agentic",
+      "subtype": "monitoring",
+      "thinking": "off",
+      "input_ids": "agentic/agent08_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Set up monitoring dashboards and alerts for API latency, error rate, and queue depth. List metrics and alert thresholds."
+    },
+    {
+      "id": "agent08",
+      "category": "agentic",
+      "subtype": "monitoring",
+      "thinking": "on",
+      "input_ids": "agentic/agent08_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Set up monitoring dashboards and alerts for API latency, error rate, and queue depth. List metrics and alert thresholds."
+    },
+    {
+      "id": "agent09",
+      "category": "agentic",
+      "subtype": "implement_feature",
+      "thinking": "off",
+      "input_ids": "agentic/agent09_think_off.json",
+      "prompt_tokens": 37,
+      "text": "Implement a new POST /exports endpoint from the API spec in README. Include validation, auth, and integration test stubs."
+    },
+    {
+      "id": "agent09",
+      "category": "agentic",
+      "subtype": "implement_feature",
+      "thinking": "on",
+      "input_ids": "agentic/agent09_think_on.json",
+      "prompt_tokens": 33,
+      "text": "Implement a new POST /exports endpoint from the API spec in README. Include validation, auth, and integration test stubs."
+    },
+    {
+      "id": "agent10",
+      "category": "agentic",
+      "subtype": "deploy_plan",
+      "thinking": "off",
+      "input_ids": "agentic/agent10_think_off.json",
+      "prompt_tokens": 36,
+      "text": "Plan a zero-downtime deployment for this service: steps, rollback, feature flags, and pre/post deploy checks."
+    },
+    {
+      "id": "agent10",
+      "category": "agentic",
+      "subtype": "deploy_plan",
+      "thinking": "on",
+      "input_ids": "agentic/agent10_think_on.json",
+      "prompt_tokens": 32,
+      "text": "Plan a zero-downtime deployment for this service: steps, rollback, feature flags, and pre/post deploy checks."
+    }
+  ]
+}

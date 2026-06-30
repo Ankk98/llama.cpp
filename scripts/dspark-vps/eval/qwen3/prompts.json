@@ -1,0 +1,106 @@
+{
+  "code": [
+    {
+      "id": "code01",
+      "subtype": "data_structure",
+      "text": "Write a Python thread-safe LRU cache with TTL expiry, async get/set, metrics hooks, and pytest tests. Stdlib only, type hints required."
+    },
+    {
+      "id": "code02",
+      "subtype": "api",
+      "text": "Implement a FastAPI REST service with JWT auth, rate limiting middleware, pydantic models, and OpenAPI docs. Include error handling."
+    },
+    {
+      "id": "code03",
+      "subtype": "sql",
+      "text": "Optimize this SQL query for a 10M-row orders table with indexes. Explain the plan and provide rewritten SQL with comments."
+    },
+    {
+      "id": "code04",
+      "subtype": "algorithm",
+      "text": "Implement a balanced binary search tree in Python with insert, delete, search, and in-order traversal. Include complexity analysis."
+    },
+    {
+      "id": "code05",
+      "subtype": "frontend",
+      "text": "Create a React TypeScript component for a paginated data table with sorting, filtering, and accessible keyboard navigation."
+    },
+    {
+      "id": "code06",
+      "subtype": "devops",
+      "text": "Write a docker-compose stack for postgres, redis, and a worker service with healthchecks, volumes, and env-based config."
+    },
+    {
+      "id": "code07",
+      "subtype": "testing",
+      "text": "Write pytest tests for an async HTTP client wrapper including retries, timeouts, mocked 5xx responses, and concurrency cases."
+    },
+    {
+      "id": "code08",
+      "subtype": "parser",
+      "text": "Implement a recursive descent parser for a tiny expression language (+, -, *, /, parentheses). Return AST and evaluation function."
+    },
+    {
+      "id": "code09",
+      "subtype": "graph",
+      "text": "Implement BFS and DFS for an unweighted directed graph. Detect cycles and return shortest path between two nodes."
+    },
+    {
+      "id": "code10",
+      "subtype": "cli",
+      "text": "Build a Python CLI with argparse subcommands to backup, restore, and list snapshots from a local directory tree."
+    }
+  ],
+  "agentic": [
+    {
+      "id": "agent01",
+      "subtype": "explore",
+      "text": "List the files in the current directory and summarize what this project does. Mention main modules and entry points."
+    },
+    {
+      "id": "agent02",
+      "subtype": "debug_ci",
+      "text": "CI is failing on the latest commit. Inspect the repo, identify the failing test, propose a minimal fix, and explain root cause."
+    },
+    {
+      "id": "agent03",
+      "subtype": "refactor",
+      "text": "Refactor the authentication module to separate token validation from route handlers. Keep behavior identical and list changed files."
+    },
+    {
+      "id": "agent04",
+      "subtype": "observability",
+      "text": "Add structured logging and request tracing to the HTTP service. Include correlation IDs and log levels configurable via env."
+    },
+    {
+      "id": "agent05",
+      "subtype": "debug_perf",
+      "text": "Users report a memory leak after long runs. Profile likely causes, point to code paths, and suggest a fix with test plan."
+    },
+    {
+      "id": "agent06",
+      "subtype": "migration",
+      "text": "Write a database migration script from schema v2 to v3 with rollback support. Handle nullable columns and backfill safely."
+    },
+    {
+      "id": "agent07",
+      "subtype": "review",
+      "text": "Review the open pull request changes for security issues, API breakage, and missing tests. Provide actionable comments."
+    },
+    {
+      "id": "agent08",
+      "subtype": "monitoring",
+      "text": "Set up monitoring dashboards and alerts for API latency, error rate, and queue depth. List metrics and alert thresholds."
+    },
+    {
+      "id": "agent09",
+      "subtype": "implement_feature",
+      "text": "Implement a new POST /exports endpoint from the API spec in README. Include validation, auth, and integration test stubs."
+    },
+    {
+      "id": "agent10",
+      "subtype": "deploy_plan",
+      "text": "Plan a zero-downtime deployment for this service: steps, rollback, feature flags, and pre/post deploy checks."
+    }
+  ]
+}
