@@ -20,7 +20,7 @@ Gemma4 reference numbers: [dspark-benchmark-experiments.md](dspark-benchmark-exp
 
 1. Vanilla first (cool GPU), 3s cooldown, then speculative (`DSPARK_BENCH_NO_COOLDOWN=1` to skip).
 2. Fixed `n_max` (`DSPARK_NO_ADAPTIVE_NMAX=1`).
-3. **Always `-c 512`** for these prompts.
+3. **`-c 512`** for short single-fixture runs; **`-c 8096`** for the 20-prompt suite (default in `dspark-bench-qwen3.py`).
 4. `temp=0`, `seed=42` for token-match checks.
 5. Report **tgp** speedup (decode throughput).
 
@@ -100,6 +100,158 @@ Keep threshold `0` for throughput on Vulkan Q4.
 
 ---
 
+## 2026-06-30: Full eval suite (20 prompts x thinking x confidence)
+
+**Commit:** `3b6d47010` (`bench: drop MTP from Qwen3 suite`)
+
+**Command:**
+
+```bash
+python3 scripts/dspark-bench-qwen3.py --no-cooldown
+```
+
+**Suite shape:** 10 code + 10 agentic prompts, thinking on/off, confidence
+`{0.0, 0.3, 0.5, 0.7, 0.9}`, `n_max=4`, `n_predict=200`, `-c 8096`,
+`temp=0`, `seed=42`, vanilla-first then DSpark per row.
+
+**Runs:** 40 vanilla + 200 DSpark = 240 harness invocations.
+
+**Artifacts:** per-run JSON in `scripts/dspark-vps/eval/qwen3/runs/`,
+vanilla references in `expected/`, aggregate CSV in `results.csv`.
+Runtime outputs are gitignored (see `.gitignore`).
+
+### Token match (correctness)
+
+Comparison is **token ID equality** against vanilla reference (`expected/`),
+not raw UTF-8 bytes. Detokenized text matches iff every generated token ID
+matches.
+
+| Scope | Match | Rate |
+|-------|-------|------|
+| All 200 DSpark runs | 75 / 200 | 37.5% |
+| `conf=0.0` only | 16 / 40 | 40.0% |
+
+Mismatches are **not** confined to early tokens: median first mismatch at
+gen index **85** (mean 92.6, range 3-199). Only 7/125 mismatches occur
+within the first 20 generated tokens.
+
+Early smoke (`--quick`, `n=64`, 4 prompts) showed **100% match** and
+1.0-1.4x speedup. The full 20-prompt suite is the realistic picture.
+
+### Acceptance rate and speedup by confidence
+
+| Threshold | Accept % | Accept/step | Token match | Mean tgp speedup |
+|-----------|----------|-------------|-------------|------------------|
+| **0.0** | **48.7** | 1.95 | 16/40 | **1.01x** |
+| 0.3 | 39.2 | 2.43 | 13/40 | 0.81x |
+| 0.5 | 50.6 | 2.26 | 15/40 | 0.84x |
+| 0.7 | 69.6 | 1.71 | 13/40 | 0.76x |
+| 0.9 | 92.4 | 0.81 | 18/40 | 0.54x |
+
+Higher confidence raises per-token acceptance but **truncates drafts** (0.81
+tokens/step at 0.9). Verify overhead dominates; throughput drops to 0.54x.
+
+**`conf=0.0` breakdown:**
+
+| Slice | Accept % | Speedup | Token match |
+|-------|----------|---------|-------------|
+| thinking off | 58.1 | 1.13x | 10/20 |
+| thinking on | 39.2 | 0.88x | 6/20 |
+| code | 51.3 | 1.04x | 7/20 |
+| agentic | 46.1 | 0.97x | 9/20 |
+
+Best per-prompt speedup at `conf=0`: `code09` 1.22x (match YES). Several
+fast prompts still mismatch tokens (`code04` 1.16x match NO).
+
+Contrast with padded `code_500l` fixture (above): **94% accept, 2.03x** on
+a single repetitive coding prompt. Varied real prompts do not replicate that.
+
+### Timing: vanilla vs speculative (`conf=0.0`, means over 40 runs)
+
+**Vanilla (target only)**
+
+| Metric | Value |
+|--------|-------|
+| PP one pass (prefill prompt) | 99.4 ms |
+| TGP decode phase (`n_predict=200`) | 4615 ms |
+| Implied ms/token (`gen_ms / 200`) | 23.1 ms |
+| PP throughput | ~390 tok/s |
+| TGP throughput | 43.3 tok/s |
+
+**DSpark speculative**
+
+| Metric | Value |
+|--------|-------|
+| PP one pass | 101.5 ms (~same as vanilla) |
+| TGP decode phase | 4700 ms |
+| Draft per propose step | 13.2 ms |
+| Verify per propose step | 54.2 ms |
+| Avg ms/token effective | 23.5 ms |
+| TGP throughput | 43.7 tok/s (**1.01x**) |
+| Propose steps (avg) | 69.7 |
+| Tokens per propose step | 2.95 |
+
+Whole decode phase split: draft **20%** / verify **80%** of `gen_ms`
+(~920 ms draft, ~3778 ms verify).
+
+### Bottleneck analysis (`conf=0.0`)
+
+Per speculative **propose step** (~67.4 ms total):
+
+| Stage | ms/step | Share |
+|-------|---------|-------|
+| Draft model forward + CPU sampling | 13.2 | 20% |
+| Target verify (total) | 54.2 | 80% |
+| - logits decode (batched target fwd) | 23.1 | 43% of verify |
+| - accept / sampling | 30.0 | 55% of verify |
+| - feature redecode | 1.1 | ~2% |
+| - process | 1.1 | ~2% |
+
+**Verify is ~4.1x draft cost per step.** Draft is cheap; batched target
+forward + accept dominates. At ~49% acceptance and ~2.0 tokens accepted per
+step with `n_max=4`, extra draft work is not amortized.
+
+At `conf > 0`, draft step rises to **~35-38 ms** (full `block_size=7`
+decode + hidden states for confidence head), making throughput worse despite
+higher accept %.
+
+### Confidence head
+
+Qwen3 draft GGUF has `enable_confidence_head=true`.
+
+| `confidence_threshold` | Behavior |
+|------------------------|----------|
+| `0.0` | Confidence head **disabled** at runtime. Full block proposed. |
+| `> 0` | Per-position confidence logit from draft hidden states; `sigmoid(conf)` compared to threshold; proposal truncated at first failure (`dspark_confident_prefix_length`). |
+
+Confidence scores are **not exported** in benchmark JSON/CSV; only threshold
+and resulting accept/truncation metrics appear.
+
+### Learnings
+
+1. **No net speedup on varied Q4 prompts yet.** Best case `conf=0` is ~1.01x
+   mean tgp. Target 1.5-2x requires ~94% accept (see `code_500l`), not ~49%.
+2. **Verify is the wall.** ~54 ms/step target work vs ~13 ms draft. Need
+   more accepted tokens per verify to beat vanilla's ~23 ms/token.
+3. **Correctness gap.** 62.5% of runs diverge from vanilla token stream.
+   Thinking-on is worse (39% accept, 0.88x). Investigate batched verify vs
+   vanilla sampling path on Q4.
+4. **Confidence tuning is a speed trap here.** Higher threshold improves accept
+   % but shrinks drafts so much that verify overhead dominates (0.54x at 0.9).
+   Keep threshold `0` for throughput on Vulkan Q4.
+5. **Short smoke misleads.** `n=64` on 4 prompts: match + 1.2-1.4x. Full
+   suite exposes divergence and ~1.0x throughput.
+6. **Prompt sensitivity.** Code prompts slightly better than agentic at `conf=0`,
+   but neither class reliably hits 1.5x on real prompts.
+
+### CSV note
+
+Rows appended for commit `3b6d47010` have **column drift** (header written
+before `draft_model_path` and other fields were added). Use per-run JSON in
+`runs/` as authoritative until CSV is regenerated with a clean header.
+
+---
+
 ## Standard commands
 
 ```bash
@@ -133,11 +285,14 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
 
 ## Open work
 
-1. Real `code_500l` token fixture from Qwen3 chat template (not padded code_short).
-2. `n_max=4` token match on `general.json` short run (batched verify edge case).
-3. Agentic acceptance / speedup (31% hit rate on Q4).
-4. CUDA Qwen3 verify path (inherit sequential default from Gemma).
-5. Publish draft GGUF: [ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF](https://huggingface.co/ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF).
+1. **Token match on full suite** - 62.5% of DSpark runs diverge from vanilla;
+   thinking-on and agentic prompts worst. Batched verify vs vanilla sampling?
+2. **Raise acceptance on real prompts** - ~49% at `conf=0` vs ~94% on padded
+   `code_500l`. Draft quality / Q4 numerics / feature injection?
+3. Real `code_500l` token fixture from Qwen3 chat template (not padded code_short).
+4. Regenerate `results.csv` with stable header (column drift on `3b6d47010` rows).
+5. CUDA Qwen3 verify path (inherit sequential default from Gemma).
+6. Publish draft GGUF: [ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF](https://huggingface.co/ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF).
 
 ---
 
