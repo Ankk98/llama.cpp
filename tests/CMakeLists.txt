@@ -211,6 +211,7 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
+# llama_build_and_test(test-regex-partial.cpp)  # TODO: add test-regex-partial.cpp
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -312,5 +313,5 @@ llama_build(smoke_phase2_graph.cpp)
 llama_build(smoke_phase3a_speculative.cpp)
 llama_build(smoke_phase3b_confidence.cpp)
 llama_build(smoke_phase3c_rejection.cpp)
+llama_build(smoke_phase4_qwen3.cpp)
 llama_build(compare_vanilla_speculative.cpp)
-llama_build(smoke_batched_logits_repro.cpp)
