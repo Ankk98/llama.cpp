@@ -3429,6 +3429,18 @@ bool common_speculative_dspark_verify_batched(
                 spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
     }
 
+#if defined(GGML_USE_CUDA)
+    // CUDA multi-token verify logits diverge from the sequential chain (row > 0) on
+    // Gemma4/DSpark; batched fast path breaks token match by ~gen 8. Force sequential
+    // unless explicitly overridden (DSPARK_VERIFY_FAST_FORCE=1).
+    if (getenv("DSPARK_VERIFY_FAST") != nullptr
+            && getenv("DSPARK_VERIFY_FAST_FORCE") == nullptr
+            && (draft_probs == nullptr || draft_probs->empty())) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+#endif
+
     // Fast paths below (defer / split verify) are opt-in via DSPARK_VERIFY_FAST=1.
     llama_context * ctx_feat = nullptr;
     for (auto & impl : spec->impls) {
@@ -3472,7 +3484,9 @@ bool common_speculative_dspark_verify_batched(
         dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, seq_id);
     }
 
-    common_speculative_dspark_target_features_enable(spec, defer_layers);
+    // Layer taps must stay enabled during verify decode (same as sequential verify).
+    // Disabling them changes the target graph and breaks greedy token match on CUDA.
+    common_speculative_dspark_target_features_enable(spec, true);
 
     if (defer_layers) {
         llama_set_defer_layer_inp_extract(ctx_tgt, true);
@@ -3585,13 +3599,15 @@ bool common_speculative_dspark_verify_batched(
     }
 
     const int64_t t_feat = timing ? ggml_time_us() : 0;
-    if (!common_speculative_dspark_process_committed(
-            spec, ctx_tgt, seq_id, pos_verify, anchor, out_ids, batch)) {
+
+    dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
+    const int64_t t3 = timing ? ggml_time_us() : 0;
+    if (!common_speculative_process(spec, batch)) {
         return false;
     }
     if (timing) {
         timing->features_decode_ms = 1e-3 * (ggml_time_us() - t_feat);
-        timing->process_ms         = 0;
+        timing->process_ms         = 1e-3 * (ggml_time_us() - t3);
     }
 
     return true;
