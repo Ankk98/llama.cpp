@@ -975,6 +975,36 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     }
 }
 
+llama_token llama_context::get_verify_argmax_ith(int32_t idx) {
+    output_reorder();
+
+    try {
+        const int64_t row = output_resolve_row(idx);
+
+        auto * res = gf_res_prev.get();
+        if (res == nullptr || row < 0 || (size_t) row >= res->t_argmax_out.size()) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        ggml_tensor * t = res->t_argmax_out[(size_t) row];
+        if (t == nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (backend == nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        int32_t tok = -1;
+        ggml_backend_tensor_get(t, &tok, 0, sizeof(int32_t));
+        return (llama_token) tok;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid verify argmax id %d, reason: %s\n", __func__, idx, err.what());
+        return LLAMA_TOKEN_NULL;
+    }
+}
+
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
     output_reorder();
 
@@ -1154,6 +1184,155 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+void llama_context::set_defer_layer_inp_extract(bool value) {
+    cparams.defer_layer_inp_extract = value;
+    if (!value) {
+        defer_layer_res      = nullptr;
+        defer_layer_n_tokens = 0;
+    }
+}
+
+void llama_context::set_skip_host_logits(bool value) {
+    cparams.skip_host_logits = value;
+}
+
+bool llama_context::commit_layer_inputs(size_t n_tokens) {
+    if (!cparams.defer_layer_inp_extract || defer_layer_res == nullptr || n_tokens == 0) {
+        return false;
+    }
+
+    extract_layer_inputs(defer_layer_res, defer_layer_token_offset, defer_layer_n_tokens, n_tokens);
+    defer_layer_res         = nullptr;
+    defer_layer_n_tokens    = 0;
+
+    // layer D2H is async; process() skips sync for small batches
+    synchronize();
+
+    return true;
+}
+
+namespace {
+
+static bool gpu_argmax_logits_rows(
+        ggml_backend_t    backend,
+        ggml_tensor     * t_logits,
+        int32_t           n_vocab,
+        const int32_t   * rows,
+        int32_t           n_rows,
+        int32_t         * out_tokens) {
+    if (backend == nullptr || t_logits == nullptr || rows == nullptr || out_tokens == nullptr || n_rows <= 0) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (n_rows * 4 + 16) + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    std::vector<ggml_tensor *> outs;
+    outs.reserve((size_t) n_rows);
+
+    for (int32_t i = 0; i < n_rows; ++i) {
+        const int64_t row = rows[i];
+        ggml_tensor * view = ggml_view_1d(ctx, t_logits, n_vocab, (size_t) row * t_logits->nb[1]);
+        ggml_tensor * tok  = ggml_argmax(ctx, view);
+        ggml_set_output(tok);
+        ggml_build_forward_expand(gf, tok);
+        outs.push_back(tok);
+    }
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (galloc == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    bool ok = ggml_gallocr_alloc_graph(galloc, gf);
+    if (ok) {
+        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    }
+
+    if (ok) {
+        for (int32_t i = 0; i < n_rows; ++i) {
+            ggml_backend_tensor_get(outs[i], &out_tokens[i], 0, sizeof(int32_t));
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+
+    return ok;
+}
+
+} // namespace
+
+bool llama_context::greedy_verify_accept(
+        const int32_t     * batch_idxs,
+        int32_t             n_idxs,
+        const llama_token * draft,
+        int32_t             n_draft,
+        llama_token       * out,
+        int32_t           * n_out) {
+    if (batch_idxs == nullptr || draft == nullptr || out == nullptr || n_out == nullptr) {
+        return false;
+    }
+
+    if (n_idxs != n_draft + 1 || n_draft < 0) {
+        return false;
+    }
+
+    synchronize();
+
+    auto * res = gf_res_prev.get();
+    if (res == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * t_logits = res->get_logits();
+    if (t_logits == nullptr) {
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+    if (backend == nullptr) {
+        return false;
+    }
+
+    const int32_t n_vocab = (int32_t) model.vocab.n_tokens();
+
+    std::vector<int32_t> rows;
+    rows.reserve((size_t) n_idxs);
+    for (int32_t i = 0; i < n_idxs; ++i) {
+        rows.push_back((int32_t) output_resolve_row(batch_idxs[i]));
+    }
+
+    std::vector<int32_t> toks((size_t) n_idxs);
+    if (!gpu_argmax_logits_rows(backend, t_logits, n_vocab, rows.data(), n_idxs, toks.data())) {
+        return false;
+    }
+
+    int32_t n = 0;
+    for (int32_t i = 0; i < n_draft; ++i) {
+        out[n++] = (llama_token) toks[i];
+        if (draft[i] != out[i]) {
+            *n_out = n;
+            return true;
+        }
+    }
+
+    out[n++] = (llama_token) toks[n_draft];
+    *n_out = n;
+    return true;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -1660,7 +1839,22 @@ static void copy_tensor_async_candidates(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(
+        const llama_cparams & cparams,
+        const llama_ubatch & ubatch,
+        const std::map<llama_seq_id, llama_sampler *> & samplers) {
+    int32_t n_output_rows = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.output[i]) {
+            n_output_rows++;
+        }
+    }
+
+    // fused per-row argmax already covers greedy sampling when skip_host_logits is set
+    if (n_output_rows > 1 && cparams.skip_host_logits) {
+        return false;
+    }
+
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
@@ -1887,7 +2081,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && !cparams.skip_host_logits && needs_raw_logits(cparams, ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1961,7 +2155,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        if (cparams.defer_layer_inp_extract) {
+            defer_layer_res          = res;
+            defer_layer_token_offset = (size_t) n_tokens_prev;
+            defer_layer_n_tokens     = (size_t) ubatch.n_tokens;
+        } else {
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2221,7 +2421,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tensor_rows, size_t n_commit_rows) {
+    if (n_commit_rows == 0) {
+        n_commit_rows = n_tensor_rows;
+    }
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2236,16 +2440,19 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         const size_t nbytes = ggml_nbytes(t);
         const size_t nfloats = nbytes / sizeof(float);
-        GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
+        GGML_ASSERT(n_tensor_rows > 0);
+        GGML_ASSERT(n_commit_rows > 0);
+        GGML_ASSERT(n_commit_rows <= n_tensor_rows);
+        GGML_ASSERT(nfloats % n_tensor_rows == 0);
 
-        const size_t row_floats = nfloats / n_tokens;
+        const size_t row_floats = nfloats / n_tensor_rows;
         const size_t dst_offset = token_offset * row_floats;
-        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+        const size_t copy_nbytes = n_commit_rows * row_floats * sizeof(float);
+        GGML_ASSERT(dst_offset + copy_nbytes / sizeof(float) <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, copy_nbytes);
     }
 }
 
@@ -2321,7 +2528,11 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT ||
+        model.arch == LLM_ARCH_KIMI_LINEAR ||
+        model.arch == LLM_ARCH_QWEN35 ||
+        model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_DEEPSEEK4) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
@@ -3666,6 +3877,10 @@ float * llama_get_logits(llama_context * ctx) {
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
+    return llama_get_logits_ith_no_sync(ctx, i);
+}
+
+float * llama_get_logits_ith_no_sync(llama_context * ctx, int32_t i) {
     float * res = nullptr;
 
     res = ctx->get_sampled_logits_ith(i);
@@ -3703,6 +3918,33 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
+void llama_set_defer_layer_inp_extract(llama_context * ctx, bool value) {
+    ctx->set_defer_layer_inp_extract(value);
+}
+
+bool llama_commit_layer_inputs(llama_context * ctx, size_t n_tokens) {
+    return ctx->commit_layer_inputs(n_tokens);
+}
+
+void llama_set_skip_host_logits(llama_context * ctx, bool value) {
+    ctx->set_skip_host_logits(value);
+}
+
+llama_token llama_get_verify_argmax_ith(llama_context * ctx, int32_t i) {
+    return ctx->get_verify_argmax_ith(i);
+}
+
+bool llama_greedy_verify_accept(
+        llama_context     * ctx,
+        const int32_t     * batch_idxs,
+        int32_t             n_idxs,
+        const llama_token * draft,
+        int32_t             n_draft,
+        llama_token       * out,
+        int32_t           * n_out) {
+    return ctx->greedy_verify_accept(batch_idxs, n_idxs, draft, n_draft, out, n_out);
+}
+
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
@@ -3730,6 +3972,10 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
+    return llama_get_embeddings_layer_inp_no_sync(ctx, lid);
+}
+
+float * llama_get_embeddings_layer_inp_no_sync(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp(lid);
 }
 

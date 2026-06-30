@@ -317,7 +317,14 @@ int llama_completion(int argc, char ** argv) {
 
         if (params.interactive_first || !prompt.empty() || session_tokens.empty()) {
             LOG_DBG("tokenize the prompt\n");
-            embd_inp = common_tokenize(ctx, prompt, true, true);
+            if (!params.input_ids_file.empty()) {
+                if (!common_load_input_ids_json(params.input_ids_file, embd_inp)) {
+                    LOG_ERR("failed to load input ids from %s\n", params.input_ids_file.c_str());
+                    return 1;
+                }
+            } else {
+                embd_inp = common_tokenize(ctx, prompt, true, true);
+            }
         } else {
             LOG_DBG("use session tokens\n");
             embd_inp = session_tokens;

@@ -14,6 +14,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4,
 };
 
 enum llama_swa_type {
@@ -226,6 +227,16 @@ struct llama_hparams {
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
 
+    // DeepSeek-V4
+    uint32_t dsv4_o_group_count        = 0;
+    uint32_t dsv4_o_lora_rank          = 0;
+    uint32_t dsv4_hc_mult              = 0;
+    uint32_t dsv4_hc_sinkhorn_iters    = 0;
+    uint32_t dsv4_hash_layer_count     = 0;
+    float    dsv4_compress_rope_base   = 0.0f;
+    float    dsv4_hc_eps               = 0.0f;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more
@@ -242,6 +253,12 @@ struct llama_hparams {
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
+
+    // dspark speculative draft
+    uint32_t dspark_block_size = 0;
+    uint32_t markov_rank = 0;
+    bool enable_confidence_head = false;
+    bool confidence_head_with_markov = false;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141

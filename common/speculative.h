@@ -46,6 +46,9 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional output: per-position draft probability vectors (DSpark, temp > 0)
+    std::vector<std::vector<float>> * draft_probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -64,6 +67,74 @@ bool common_speculative_need_embd_nextn(common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
+// update runtime DSpark options (temp/seed/confidence) before drafting
+void common_speculative_sync_params(common_speculative * spec, const common_params_speculative & params);
+
+// DSpark: toggle expensive target layer-input extraction (5 hidden tensors per token)
+void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
+
+struct common_speculative_dspark_prefill_timing {
+    double fast_ms  = 0; // target decode with layer taps off (optional first pass)
+    double setup_ms = 0; // target decode with layer taps on + process()
+};
+
+// DSpark/DeepSpec prefill: target decode inp[0..n-2], then process() into draft KV.
+// fast_ttft: layer-tap-free decode first (fast_ms), then feature decode + process (setup_ms).
+bool common_speculative_dspark_prefill(
+        common_speculative * spec,
+        struct llama_context * ctx_tgt,
+        const llama_tokens & inp,
+        struct llama_batch & batch,
+        bool fast_ttft,
+        common_speculative_dspark_prefill_timing * timing = nullptr);
+
+struct common_speculative_dspark_verify_timing {
+    double decode_submit_ms   = 0; // llama_decode return (async, no GPU sync)
+    double logits_decode_ms   = 0; // same as decode_submit_ms (legacy alias)
+    double accept_ms          = 0; // GPU fence + greedy argmax on host logits
+    double layer_commit_ms    = 0; // partial layer D2H after accept (defer path)
+    double features_decode_ms = 0;
+    double process_ms         = 0;
+};
+
+// DSpark: after logits-only verify + accept, re-decode committed prefix with features on and
+// run process() for the draft encoder / KV injection increment
+bool common_speculative_dspark_process_committed(
+        common_speculative * spec,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed_ids,
+        struct llama_batch & batch);
+
+// DSpark: batched verify (logits-only forward, then committed feature re-decode + process)
+bool common_speculative_dspark_verify_batched(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        struct llama_batch & batch,
+        common_speculative_dspark_verify_timing * timing = nullptr,
+        const std::vector<std::vector<float>> * draft_probs = nullptr,
+        float temp = 0.0f);
+
+// DSpark: sequential early-exit target verify (one token/decode, stop at first mismatch)
+bool common_speculative_dspark_verify_sequential(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        struct llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        struct llama_batch & batch);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

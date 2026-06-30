@@ -170,6 +170,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -322,7 +323,7 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_max = 4; // maximum tokens to draft; fair bench sweet spot for coding (speed + greedy match)
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
@@ -333,6 +334,7 @@ struct common_params_speculative_draft {
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_tgt_feat = nullptr; // optional: layer-input extraction (shares KV via ctx_other)
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
@@ -379,13 +381,20 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // DSpark driver (Phase 3)
+    float dspark_confidence_threshold = 0.0f;
+    float dspark_temp                 = 0.0f;
+    bool  dspark_disable_markov       = false;
+    uint32_t dspark_seed              = 0;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3
+                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -507,6 +516,7 @@ struct common_params {
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
+    std::string input_ids_file       = ""; // JSON array of token IDs (bypasses tokenization)               // NOLINT
     std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
@@ -979,6 +989,9 @@ std::vector<llama_token> common_tokenize(
            const std::string & text,
                         bool   add_special,
                         bool   parse_special = false);
+
+// load token IDs from a JSON array file (used by DSpark parity tests)
+bool common_load_input_ids_json(const std::string & path, std::vector<llama_token> & out);
 
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`

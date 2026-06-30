@@ -85,6 +85,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+bool common_sampler_is_pure_greedy(const struct common_sampler * gsmpl);
+
+// GPU argmax on verify logits rows (caller must set skip_host_logits before decode).
+std::vector<llama_token> common_sampler_greedy_accept_n_gpu(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft);
+
+// Fused per-row argmax from the verify forward graph (default greedy verify path).
+std::vector<llama_token> common_sampler_greedy_accept_n_fused(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int>  & idxs,
+        const llama_tokens      & draft);
+
+llama_token common_sampler_greedy_argmax(const float * logits, int n_vocab);
+
+llama_token common_sampler_sample_after_sync(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first);
+
+// DSpark verify with rejection sampling using external post-Markov draft_probs
+std::vector<llama_token> common_sampler_sample_and_accept_n_dspark(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<float>> & draft_probs,
+        float temp,
+        bool grammar_first = false);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

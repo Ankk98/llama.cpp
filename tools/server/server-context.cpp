@@ -173,6 +173,7 @@ struct server_slot {
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
+    std::vector<std::vector<float>> spec_draft_probs;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
@@ -2977,13 +2978,16 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_probs.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting    = */ true,
+                            /* .n_max       = */ n_draft_max,
+                            /* .n_past      = */ slot.prompt.n_tokens(),
+                            /* .id_last     = */ slot.sampled,
+                            /* .prompt      = */ &slot.spec_prompt,
+                            /* .result      = */ &slot.spec_draft,
+                            /* .draft_probs = */ &slot.spec_draft_probs,
                         };
 
                         drafting.push_back(&slot);
@@ -2993,7 +2997,13 @@ private:
         });
 
         // generate the actual drafts (if any)
-        {
+        if (!drafting.empty()) {
+            auto spec_params = params_base.speculative;
+            for (server_slot * slot : drafting) {
+                spec_params.dspark_temp                 = slot->task->params.sampling.temp;
+                spec_params.dspark_seed               = slot->task->params.sampling.seed;
+            }
+            common_speculative_sync_params(spec.get(), spec_params);
             common_speculative_draft(spec.get());
         }
 
@@ -3837,7 +3847,16 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                auto accepted = [&]() {
+                    if (!slot.spec_draft_probs.empty() && slot.task->params.sampling.temp > 1e-5f) {
+                        return common_sampler_sample_and_accept_n_dspark(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                slot.spec_draft_probs, slot.task->params.sampling.temp);
+                    }
+                    return common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }();
+                slot.spec_draft_probs.clear();
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

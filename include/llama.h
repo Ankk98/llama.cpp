@@ -1007,7 +1007,11 @@ extern "C" {
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
-    LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+  LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Same as llama_get_logits_ith(), but does not synchronize the context first.
+    // The caller must have already synchronized after the preceding llama_decode().
+    LLAMA_API float * llama_get_logits_ith_no_sync(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

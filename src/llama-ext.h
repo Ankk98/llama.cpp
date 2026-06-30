@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -113,6 +114,25 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+LLAMA_API float * llama_get_embeddings_layer_inp_no_sync(struct llama_context * ctx, uint32_t lid);
+
+// Defer layer-input D2H until commit_layer_inputs() after speculative accept (saves rejected rows).
+LLAMA_API void llama_set_defer_layer_inp_extract(struct llama_context * ctx, bool value);
+LLAMA_API bool llama_commit_layer_inputs(struct llama_context * ctx, size_t n_tokens);
+
+// Skip full-vocab logits D2H during multi-row decode (use llama_get_verify_argmax_ith).
+LLAMA_API void llama_set_skip_host_logits(struct llama_context * ctx, bool value);
+LLAMA_API llama_token llama_get_verify_argmax_ith(struct llama_context * ctx, int32_t i);
+
+// Greedy argmax on GPU logits rows (batch_idxs length = n_draft + 1). temp=0 only.
+LLAMA_API bool llama_greedy_verify_accept(
+        struct llama_context * ctx,
+        const int32_t     * batch_idxs,
+        int32_t             n_idxs,
+        const llama_token * draft,
+        int32_t             n_draft,
+        llama_token       * out,
+        int32_t           * n_out);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
@@ -124,3 +144,50 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// DSpark speculative driver CPU weights (markov + confidence; copied from draft model at init)
+struct llama_dspark_spec_cpu {
+    uint32_t block_size                 = 0;
+    uint32_t markov_rank                = 0;
+    int32_t  n_vocab                    = 0;
+    int32_t  n_embd                     = 0;
+    float    logit_softcap              = 0.0f; // 0 = disabled
+    bool     enable_confidence_head     = false;
+    bool     confidence_head_with_markov = false;
+
+    std::vector<float> markov_w1;         // ggml layout [markov_rank, n_vocab]
+    std::vector<float> markov_w2;         // ggml layout [markov_rank, n_vocab]
+    std::vector<float> confidence_proj_w; // [conf_in]
+    float              confidence_proj_b = 0.0f;
+};
+
+LLAMA_API bool llama_dspark_spec_cpu_init(const struct llama_model * model, llama_dspark_spec_cpu * out);
+
+// DSpark Markov head evaluated on the backend that holds the markov weights (GPU when the
+// draft is offloaded). The vanilla Markov head is autoregressive (each block position needs
+// the previously sampled token), so it is driven as a per-position matvec dispatch from the
+// CPU sampling loop - this offloads only the heavy markov_w2 @ markov_w1[:, tok] matvec.
+struct llama_dspark_markov_gpu;
+
+LLAMA_API struct llama_dspark_markov_gpu * llama_dspark_markov_gpu_init(const struct llama_model * model);
+LLAMA_API void                             llama_dspark_markov_gpu_free(struct llama_dspark_markov_gpu * h);
+
+// Writes bias[n_vocab] = markov_w2 @ markov_w1[:, prev_token] into out (caller-allocated).
+LLAMA_API bool llama_dspark_markov_gpu_bias(struct llama_dspark_markov_gpu * h, int32_t prev_token, float * out);
+
+// DSpark greedy block sampler, fully fused on the markov-weight backend. The autoregressive
+// markov chain (softcap -> +markov_bias -> argmax -> feed next position) for an entire block is
+// unrolled into a SINGLE graph submit, so the per-step cost is one dispatch instead of block_size
+// separate matvec round-trips, and only block_size token ids are read back (no n_vocab copyback).
+// Greedy/argmax only (temperature 0); callers needing sampled probs use the CPU path.
+struct llama_dspark_block_sample_gpu;
+
+LLAMA_API struct llama_dspark_block_sample_gpu * llama_dspark_block_sample_gpu_init(
+        const struct llama_model * model, int32_t block_size, float logit_softcap);
+LLAMA_API void llama_dspark_block_sample_gpu_free(struct llama_dspark_block_sample_gpu * h);
+
+// logits: block_size * n_vocab floats, position-major (position i at logits + i*n_vocab).
+// anchor: id_last (token before position 0). out_tokens: caller-allocated int32[block_size].
+// Returns false on failure so the caller can fall back to the per-position CPU path.
+LLAMA_API bool llama_dspark_block_sample_gpu_run(
+        struct llama_dspark_block_sample_gpu * h, const float * logits, int32_t anchor, int32_t * out_tokens);

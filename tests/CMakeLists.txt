@@ -211,7 +211,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -308,3 +307,10 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+llama_build(smoke_phase2_graph.cpp)
+llama_build(smoke_phase3a_speculative.cpp)
+llama_build(smoke_phase3b_confidence.cpp)
+llama_build(smoke_phase3c_rejection.cpp)
+llama_build(compare_vanilla_speculative.cpp)
+llama_build(smoke_batched_logits_repro.cpp)

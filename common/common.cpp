@@ -29,6 +29,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1681,6 +1683,41 @@ std::vector<llama_token> common_tokenize(
         result.resize(n_tokens);
     }
     return result;
+}
+
+bool common_load_input_ids_json(const std::string & path, std::vector<llama_token> & out) {
+    out.clear();
+
+    std::ifstream f(path);
+    if (!f) {
+        LOG_ERR("%s: failed to open input ids file: %s\n", __func__, path.c_str());
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to parse JSON in %s: %s\n", __func__, path.c_str(), e.what());
+        return false;
+    }
+
+    if (!j.is_array()) {
+        LOG_ERR("%s: expected JSON array in %s\n", __func__, path.c_str());
+        return false;
+    }
+
+    out.reserve(j.size());
+    for (const auto & el : j) {
+        if (!el.is_number_integer()) {
+            LOG_ERR("%s: expected integer token ids in %s\n", __func__, path.c_str());
+            out.clear();
+            return false;
+        }
+        out.push_back((llama_token) el.get<int64_t>());
+    }
+
+    return true;
 }
 
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {

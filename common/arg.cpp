@@ -3776,6 +3776,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
+        {"--input-ids"}, "FNAME",
+        "JSON array of token IDs for the prompt (bypasses tokenization; used for DSpark parity runs)",
+        [](common_params & params, const std::string & value) {
+            params.input_ids_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--dspark-confidence-threshold"}, "T",
+        string_format("DSpark confidence truncation threshold (default: %.3f; 0 = full block)", params.speculative.dspark_confidence_threshold),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dspark_confidence_threshold = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--dspark-disable-markov"},
+        "disable DSpark vanilla Markov head (debug / smoke only)",
+        [](common_params & params) {
+            params.speculative.dspark_disable_markov = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
         [](common_params & params, int value) {
