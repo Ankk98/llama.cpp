@@ -18,10 +18,10 @@ Related docs:
 |--------|--------|
 | Greedy verify correctness | Fixed. Parallel multi-row accept was wrong semantics at `temp=0`. Default is now sequential one-token decode. |
 | Post-fix spot checks (`n=200`, `c=8096`, `conf=0`, `n_max=4`) | `code01_think_off` YES, `agent03_think_on` YES, `code_500l` YES |
-| Known remaining mismatch | `code01_think_on` NO @ gen 198 when `n >= 199` (even with `DSPARK_VERIFY_SEQ=1`) - separate from verify semantics; likely thinking/EOS handling in the main spec loop |
+| Known remaining mismatch | None on post-fix spot checks (incl. `code01_think_on` @ n=199) |
 | Full 20-prompt suite | **Not re-run post-fix.** Pre-fix run (`3b6d47010`) had **37.5% token match** (75/200 DSpark rows). Stale until regenerated. |
 
-**Bottom line:** Correctness is restored for the verify path we fixed. We still owe a full-suite re-benchmark and one open bug on `code01_think_on` near generation boundary.
+**Bottom line:** Greedy verify uses scratch parallel logits + canonical commit. Token match YES on spot checks. Full 20-prompt suite still needs re-run for baseline.
 
 ---
 
@@ -143,9 +143,9 @@ Higher threshold raises per-token acceptance but forces full-block draft forward
 
 | # | Task | Details | Done when |
 |---|------|---------|-----------|
-| 1 | **Re-run full 20-prompt suite post-fix** | `python3 scripts/dspark-bench-qwen3.py --no-cooldown --confidence 0.0`; regenerate `expected/` if verify fix changed outputs | 200/200 DSpark rows token match YES at `conf=0` (or documented exceptions) |
-| 2 | **Fix `code01_think_on` gen-198 mismatch** | Fails at last token when `n >= 199`; reproduces with sequential verify. Check thinking token handling, EOS/stop, and `n_predict` boundary in `run_speculative()` | Token match YES for `n=200` |
-| 3 | **Add CI/canary token-match gate** | Quick harness on 4-5 prompts (`code01`, `agent03`, `code_500l`) in smoke or nightly | Fails build on token mismatch at `temp=0` |
+| 1 | **Re-run full 20-prompt suite** | Regenerate baseline after KV reset + parallel verify fix | 200/200 token match YES at `conf=0` |
+| 2 | ~~Fix `code01_think_on` gen-198 mismatch~~ | **Done:** harness `llama_memory_clear` between vanilla/spec runs | - |
+| 3 | **Add CI/canary token-match gate** | Quick harness on 4-5 prompts with `DSPARK_KV_ASSERT=1` | Fails build on token mismatch |
 
 ### P1 - Performance (correct verify that beats vanilla)
 

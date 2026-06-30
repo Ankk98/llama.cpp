@@ -1229,7 +1229,11 @@ static void dspark_warmup_verify_graph(llama_context * ctx, int32_t n_max, llama
     }
     llama_synchronize(ctx);
     llama_batch_free(warm);
-    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 0, -1);
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (mem) {
+        llama_memory_clear(mem, true);
+    }
+    llama_synchronize(ctx);
 }
 
 static void dspark_ensure_fused_verify_graph(llama_context * ctx, int32_t n_verify, llama_seq_id seq_id) {
@@ -1253,7 +1257,7 @@ static void dspark_ensure_fused_verify_graph(llama_context * ctx, int32_t n_veri
     llama_decode(ctx, warm);
     llama_synchronize(ctx);
     llama_batch_free(warm);
-    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 0, -1);
+    common_speculative_dspark_context_reset(ctx);
 
     enabled.insert(ctx);
 }
@@ -3416,6 +3420,42 @@ void common_speculative_dspark_verify_kv_canon_reset() {
     // Legacy no-op: batched verify uses a scratch sequence instead of rolling snapshots.
 }
 
+void common_speculative_dspark_context_reset(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (mem) {
+        llama_memory_clear(mem, true);
+    }
+
+    llama_set_skip_host_logits(ctx, false);
+    llama_set_defer_layer_inp_extract(ctx, false);
+    llama_synchronize(ctx);
+    llama_perf_context_reset(ctx);
+}
+
+static void dspark_assert_canonical_kv(
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        const char * tag) {
+    if (!getenv("DSPARK_KV_ASSERT")) {
+        return;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_tgt);
+    const llama_pos kv_max = llama_memory_seq_pos_max(mem, seq_id);
+    const llama_pos expect = pos_verify - 1;
+    if (kv_max != expect) {
+        fprintf(stderr,
+                "DSPARK_KV_ASSERT: %s seq=%d pos_verify=%d kv_max=%d expect=%d\n",
+                tag, (int) seq_id, (int) pos_verify, (int) kv_max, (int) expect);
+        GGML_ABORT("DSpark canonical KV invariant violated");
+    }
+}
+
 // Scratch sequence for batched verify logits. Main seq KV stays append-only.
 static llama_seq_id dspark_verify_scratch_seq_id(const llama_context * ctx, llama_seq_id seq_id) {
     const llama_seq_id scratch = seq_id + 1;
@@ -3575,6 +3615,8 @@ static bool dspark_verify_parallel_scratch(
 
     llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
 
+    dspark_assert_canonical_kv(ctx_tgt, seq_id, pos_verify, "pre-verify");
+
     llama_synchronize(ctx_tgt);
     llama_memory_seq_rm(mem_tgt, scratch_seq, 0, -1);
     llama_memory_seq_cp(mem_tgt, seq_id, scratch_seq, -1, -1);
@@ -3663,6 +3705,8 @@ static bool dspark_verify_parallel_scratch(
         llama_set_defer_layer_inp_extract(ctx_tgt, false);
     }
 
+    dspark_assert_canonical_kv(ctx_tgt, seq_id, pos_verify, "post-verify-pre-commit");
+
     const int64_t t_rebuild = timing ? ggml_time_us() : 0;
     if (!common_speculative_dspark_process_committed(
             spec, ctx_tgt, seq_id, pos_verify, anchor, out_ids, batch, /*kv_append_only=*/ true)) {
@@ -3675,15 +3719,14 @@ static bool dspark_verify_parallel_scratch(
         timing->process_ms         = 1e-3 * (ggml_time_us() - t_rebuild);
     }
 
+    dspark_assert_canonical_kv(
+            ctx_tgt, seq_id, pos_verify + (llama_pos) out_ids.size(), "post-commit");
+
     return true;
 }
 
-// Default verify: one target decode per token, early exit on draft mismatch, process() inline.
-// This is the only correct greedy semantics at temp=0 (matches vanilla target-only decode).
-//
-// Parallel multi-token forward + multi-row accept is opt-in (DSPARK_VERIFY_PARALLEL=1) and
-// must not be used for production greedy verify: row logits from a parallel graph are not
-// guaranteed to match the one-token-at-a-time chain (causal KV accumulation differs).
+// Default verify: scratch parallel logits + accept + canonical commit (see dspark-refactor-pipeline.md).
+// Sequential one-token path via DSPARK_VERIFY_SEQ=1 only.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
@@ -3705,17 +3748,6 @@ bool common_speculative_dspark_verify_batched(
 
     // Legacy alias for sequential verify.
     if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
-        return common_speculative_dspark_verify_sequential(
-                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-    }
-
-    const bool pure_greedy = draft_probs == nullptr
-            && (temp == 0.0f || temp == -1.0f)
-            && common_sampler_is_pure_greedy(smpl);
-
-    // Greedy verify MUST use sequential one-token decode. Parallel multi-row accept reads
-    // logits from a graph that does not reproduce per-step causal KV build.
-    if (pure_greedy && getenv("DSPARK_VERIFY_PARALLEL") == nullptr) {
         return common_speculative_dspark_verify_sequential(
                 spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
     }

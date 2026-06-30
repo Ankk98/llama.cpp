@@ -289,8 +289,9 @@ Pipeline refactor does **not** remove commit decodes; it removes illegal KV writ
 ### Phase D - Correctness hardening (2 days)
 
 - [ ] KV asserts (see kv-safety doc)
-- [x] Greedy verify defaults to sequential one-token decode (fixes code01 divergence @ gen 162)
-- [ ] Parallel verify opt-in only (`DSPARK_VERIFY_PARALLEL=1`); row logits must match sequential before production use
+- [x] Greedy verify: scratch parallel logits + canonical commit (default)
+- [x] Harness KV reset via `llama_memory_clear` between vanilla and spec runs
+- [ ] KV asserts enabled in CI (`DSPARK_KV_ASSERT=1`)
 
 ### Phase E - Perf follow-ups (ongoing)
 

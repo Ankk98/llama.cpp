@@ -24,13 +24,12 @@ Gemma4 reference numbers: [dspark-benchmark-experiments.md](dspark-benchmark-exp
 4. `temp=0`, `seed=42` for token-match checks.
 5. Report **tgp** speedup (decode throughput).
 
-### Verify path (2026-06-30)
+### Verify path (2026-06-30, updated)
 
-- **Vulkan/CPU:** batched defer verify is now default at `temp=0` (was sequential via env default).
-  Opt out: `DSPARK_VERIFY_SEQ=1`.
-- **CUDA:** sequential verify remains default (`DSPARK_VERIFY_FAST_FORCE=1` to opt into batched).
-- **Harness fix:** vanilla Vulkan prefill now matches spec (full prompt + first-token sample).
-  Old `inp.size()-1` prefill caused false mismatches (e.g. agentic @ gen 78).
+- **Default:** scratch parallel verify (logits on seq+1, commit on canonical seq 0).
+- **Sequential fallback:** `DSPARK_VERIFY_SEQ=1`.
+- **Between-run reset:** `llama_memory_clear(..., true)` - `seq_rm` alone leaves stale K/V bytes and caused false mismatches (e.g. `code01_think_on` in combined harness).
+- **Debug:** `DSPARK_KV_ASSERT=1` asserts canonical `kv_max == pos_verify - 1` across verify/commit.
 
 ---
 
@@ -310,16 +309,14 @@ canonical target KV. Requires `n_parallel >= 2` when parallel verify is enabled.
 
 Debug: `DSPARK_TRACE_KV=1`, `DSPARK_VERIFY_SEQ=1` (alias for sequential).
 
-### Post-fix validation (CPU/Vulkan, n=200, c=8096, temp=0)
+### Post-fix validation (Vulkan Q4, n=200, c=8096, temp=0, parallel scratch verify)
 
-| Prompt | Default verify | `DSPARK_VERIFY_PARALLEL=1` |
-|--------|----------------|----------------------------|
-| `code01_think_off` | **YES** | **NO** @ gen 162 |
-| `agent03_think_on` | **YES** | (not re-run) |
-| `code_500l` | **YES** | (not re-run) |
-
-Parallel path still fails on `code01_think_off` @ gen 162, confirming the diagnosis:
-wrong verify semantics, not a prompt quirk.
+| Prompt | Token match | tgp speedup |
+|--------|-------------|-------------|
+| `code01_think_off` | **YES** | 0.99x |
+| `code01_think_on` | **YES** (n=199 combined harness) | 1.00x |
+| `agent03_think_on` | **YES** | 1.07x |
+| `code_500l` | **YES** | 0.92x |
 
 ### Trace tooling
 

@@ -113,7 +113,11 @@ bool common_speculative_dspark_process_committed(
         struct llama_batch & batch,
         bool kv_append_only = false);
 
-// DSpark: target verify entry point. Default sequential (correct at temp=0); parallel opt-in via DSPARK_VERIFY_PARALLEL=1
+// DSpark: clear target/draft KV and reset decode flags between benchmark runs.
+void common_speculative_dspark_context_reset(struct llama_context * ctx);
+
+// DSpark: target verify - scratch logits, accept, commit on canonical (see dspark-refactor-pipeline.md).
+// Sequential fallback via DSPARK_VERIFY_SEQ=1 only.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,

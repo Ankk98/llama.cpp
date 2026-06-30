@@ -281,7 +281,7 @@ static int run_vanilla(
 
     out->gen_ms = now_ms() - t0;
     llama_batch_free(batch);
-    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    common_speculative_dspark_context_reset(ctx_tgt);
     return 0;
 }
 
@@ -462,10 +462,17 @@ static int run_speculative(
         }
         llama_synchronize(ctx_tgt);
         llama_batch_free(warm);
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
-        if (ctx_feat) {
-            llama_memory_seq_rm(llama_get_memory(ctx_feat), 0, 0, -1);
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        if (mem) {
+            llama_memory_clear(mem, true);
         }
+        if (ctx_feat) {
+            llama_memory_t mem_f = llama_get_memory(ctx_feat);
+            if (mem_f) {
+                llama_memory_clear(mem_f, true);
+            }
+        }
+        llama_synchronize(ctx_tgt);
     }
 
     // Prefill the FULL prompt and sample the first token from the target, then draft from
@@ -650,8 +657,10 @@ static int run_speculative(
     out->gen_ms = now_ms() - t0;
     llama_batch_free(batch_tgt);
     llama_batch_free(prefill);
-    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
-    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    common_speculative_dspark_context_reset(ctx_tgt);
+    if (ctx_dft) {
+        common_speculative_dspark_context_reset(ctx_dft);
+    }
     return 0;
 }
 
@@ -735,8 +744,8 @@ int main(int argc, char ** argv) {
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
-    if (use_dspark_spec && params.n_parallel < 2 && getenv("DSPARK_VERIFY_PARALLEL") != nullptr) {
-        fprintf(stderr, "note: DSpark parallel verify needs n_parallel >= 2; using 2\n");
+    if (use_dspark_spec && params.n_parallel < 2) {
+        fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
         params.n_parallel = 2;
     }
 
@@ -821,9 +830,12 @@ int main(int argc, char ** argv) {
 
     if (has_draft) {
         llama_synchronize(ctx_tgt);
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+        common_speculative_dspark_context_reset(ctx_tgt);
         if (ctx_dft) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), 0, 0, -1);
+            common_speculative_dspark_context_reset(ctx_dft.get());
+        }
+        if (ctx_tgt_feat) {
+            common_speculative_dspark_context_reset(ctx_tgt_feat.get());
         }
         if (!bflags.spec_only) {
             const int cooldown_s = getenv("DSPARK_BENCH_NO_COOLDOWN") ? 0 : 3;

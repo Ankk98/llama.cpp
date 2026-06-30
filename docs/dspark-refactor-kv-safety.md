@@ -23,10 +23,9 @@ Scratch-sequence batched verify (`seq_id + 1`):
 3. Accept from logits; discard scratch tail
 4. Append accepted tokens on main seq via `process_committed(..., kv_append_only=true)`
 
-This restores the invariant on seq 0 for the parallel path. **Greedy accept must use
-sequential one-token decode** (default in `verify_batched()`); parallel multi-row accept
-is opt-in via `DSPARK_VERIFY_PARALLEL=1` and is incorrect for production until row logits
-match sequential decode chain.
+This restores the invariant on seq 0 for the parallel path. Greedy verify defaults to
+**scratch parallel logits + canonical commit**. Use `llama_memory_clear(..., true)` between
+benchmark runs; `seq_rm` alone leaves stale K/V bytes (false mismatches e.g. combined harness).
 
 ---
 
