@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "dspark_pipeline.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "log.h"
@@ -440,228 +441,28 @@ static int run_speculative(
         std::vector<llama_token> & inp,
         int n_predict,
         run_stats * out) {
-    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+    dspark_run_stats dstats {};
+    const int rc = dspark_pipeline_run(params, spec, smpl, ctx_tgt, ctx_dft, inp, n_predict, &dstats)
+            ? 0 : 1;
 
-    llama_tokens prompt_tgt(inp.begin(), inp.end());
-    int n_past = (int) inp.size();
+    out->output                  = std::move(dstats.output);
+    out->pp_ms                   = dstats.pp_ms;
+    out->gen_ms                  = dstats.gen_ms;
+    out->draft_ms                = dstats.draft_ms;
+    out->verify_ms               = dstats.verify_ms;
+    out->tgt_decode_ms           = dstats.tgt_decode_ms;
+    out->verify_accept_ms        = dstats.verify_accept_ms;
+    out->verify_layer_commit_ms  = dstats.verify_layer_commit_ms;
+    out->verify_features_ms      = dstats.verify_features_ms;
+    out->verify_decode_submit_ms = dstats.verify_decode_submit_ms;
+    out->verify_process_ms       = dstats.verify_process_ms;
+    out->n_prompt                = dstats.n_prompt;
+    out->n_generated             = dstats.n_generated;
+    out->n_drafted               = dstats.n_drafted;
+    out->n_accepted              = dstats.n_accepted;
+    out->n_propose_steps         = dstats.n_propose_steps;
 
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-
-    // warmup target graphs at verify batch size (n_max + 1 tokens)
-    if (!getenv("DSPARK_NO_WARMUP")) {
-        const int32_t n_verify = params.speculative.draft.n_max + 1;
-        llama_batch warm = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-        const llama_token warm_tok = inp.empty() ? 0 : inp[0];
-        for (int32_t i = 0; i < n_verify; ++i) {
-            common_batch_add(warm, warm_tok, (llama_pos) i, { 0 }, true);
-        }
-        llama_decode(ctx_tgt, warm);
-        llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
-        if (ctx_feat) {
-            llama_decode(ctx_feat, warm);
-        }
-        llama_synchronize(ctx_tgt);
-        llama_batch_free(warm);
-        llama_memory_t mem = llama_get_memory(ctx_tgt);
-        if (mem) {
-            llama_memory_clear(mem, true);
-        }
-        if (ctx_feat) {
-            llama_memory_t mem_f = llama_get_memory(ctx_feat);
-            if (mem_f) {
-                llama_memory_clear(mem_f, true);
-            }
-        }
-        llama_synchronize(ctx_tgt);
-    }
-
-    // Prefill the FULL prompt and sample the first token from the target, then draft from
-    // it (mirrors DeepSpec). This avoids a cold start where the last prompt token's target
-    // features are not yet injected into ctx_dft on the first draft - that missing context
-    // row makes the draft degenerate (repeat the anchor) for the first few steps.
-    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill batch
-    // must be fully formed (llama_batch_get_one leaves those arrays null).
-    llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-    for (size_t i = 0; i < inp.size(); ++i) {
-        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, i + 1 == inp.size());
-    }
-    out->n_prompt = (int) inp.size();
-    const double tpp = now_ms();
-    llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
-    llama_context * const ctx_prefill = ctx_tgt;
-    const bool prefill_defer = getenv("DSPARK_PREFILL_DEFER") != nullptr;
-    if (prefill_defer) {
-        llama_set_defer_layer_inp_extract(ctx_prefill, true);
-    }
-    llama_decode(ctx_prefill, prefill);
-    if (ctx_feat) {
-        llama_decode(ctx_feat, prefill);
-    }
-        if (prefill_defer) {
-            llama_commit_layer_inputs(ctx_prefill, inp.size());
-            llama_set_defer_layer_inp_extract(ctx_prefill, false);
-        }
-        if (!getenv("DSPARK_NO_PREFILL_PROCESS")) {
-            common_speculative_process(spec, prefill);
-        }
-    if (!getenv("DSPARK_NO_BEGIN")) {
-        common_speculative_begin(spec, 0, prompt_tgt);
-    }
-
-    llama_token id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
-    common_sampler_accept(smpl, id_last, true);
-    out->pp_ms = now_ms() - tpp;
-
-    // fused verify skips full-vocab logits D2H; enable after prefill first sample
-    const bool fused_verify = getenv("DSPARK_FUSED_ARGMAX") != nullptr
-            && getenv("DSPARK_GPU_GREEDY") == nullptr;
-    if (fused_verify) {
-        llama_set_skip_host_logits(ctx_tgt, true);
-    }
-
-    out->output = inp;
-    out->output.push_back(id_last);
-    out->n_generated++;
-    llama_tokens draft;
-    const double t0 = now_ms();
-
-    common_speculative_dspark_verify_kv_canon_reset();
-
-    while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
-        auto spec_params = params.speculative;
-        spec_params.dspark_temp = params.sampling.temp;
-        spec_params.dspark_seed = params.sampling.seed;
-        common_speculative_sync_params(spec, spec_params);
-
-        draft.clear();
-        if (!getenv("DSPARK_NO_DRAFT")) {
-            common_speculative_get_draft_params(spec, 0) = {
-                true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
-            };
-            const double td0 = now_ms();
-            common_speculative_draft(spec);
-            out->draft_ms += now_ms() - td0;
-        }
-
-        out->n_propose_steps++;
-        out->n_drafted += (int) draft.size();
-
-        const llama_pos pos_verify = n_past;
-        llama_tokens ids;
-        const double tv0 = now_ms();
-
-        std::vector<uint8_t> oracle_snap;
-        const bool trace_oracle = getenv("DSPARK_TRACE_ORACLE") != nullptr;
-        const bool verify_snap  = trace_oracle || getenv("DSPARK_VERIFY_PRE_SNAP") != nullptr;
-        llama_token oracle_tok = LLAMA_TOKEN_NULL;
-        llama_tokens oracle_chain;
-        if (verify_snap) {
-            if (!ctx_save_state(ctx_tgt, oracle_snap)) {
-                fprintf(stderr, "DSPARK_TRACE_ORACLE: save_state failed at step %d\n",
-                        out->n_propose_steps + 1);
-            } else if (trace_oracle) {
-                oracle_chain = vanilla_oracle_chain(
-                        ctx_tgt, batch_tgt, 0, pos_verify, id_last, draft.size() + 1);
-                oracle_tok = oracle_chain.empty() ? LLAMA_TOKEN_NULL : oracle_chain[0];
-            }
-            if (!oracle_snap.empty() && !ctx_restore_state(ctx_tgt, oracle_snap)) {
-                fprintf(stderr, "DSPARK_TRACE_ORACLE: restore failed before verify\n");
-            }
-        }
-
-        if (getenv("DSPARK_TRACE_VERIFY")) {
-            char gen_buf[32];
-            snprintf(gen_buf, sizeof(gen_buf), "%d", out->n_generated);
-            setenv("DSPARK_TRACE_VERIFY_GEN", gen_buf, 1);
-        }
-
-        if (getenv("DSPARK_VANILLA_VERIFY")) {
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, id_last, pos_verify, { 0 }, true);
-            llama_decode(ctx_tgt, batch_tgt);
-            const llama_token next = common_sampler_sample(smpl, ctx_tgt, -1, false);
-            common_sampler_accept(smpl, next, true);
-            ids.assign(1, next);
-        } else {
-            common_speculative_dspark_verify_timing vtim {};
-            if (!common_speculative_dspark_verify_batched(
-                    spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt, &vtim)) {
-                fprintf(stderr, "error: dspark verify failed\n");
-                return 1;
-            }
-            out->tgt_decode_ms     += vtim.logits_decode_ms + vtim.features_decode_ms;
-            out->verify_accept_ms  += vtim.accept_ms;
-            out->verify_layer_commit_ms += vtim.layer_commit_ms;
-            out->verify_features_ms += vtim.features_decode_ms;
-            out->verify_process_ms += vtim.process_ms;
-            out->verify_decode_submit_ms += vtim.decode_submit_ms;
-        }
-
-        out->verify_ms += now_ms() - tv0;
-
-        if (trace_oracle && !oracle_chain.empty() && !ids.empty()) {
-            const size_t n_cmp = std::min(oracle_chain.size(), ids.size());
-            for (size_t i = 0; i < n_cmp; ++i) {
-                if (ids[i] == oracle_chain[i]) {
-                    continue;
-                }
-                fprintf(stderr,
-                        "DSPARK_TRACE_ORACLE: CHAIN MISMATCH step=%d gen_index=%d "
-                        "pos_verify=%d at ids[%zu]: batched=%d vanilla=%d draft_n=%zu\n",
-                        out->n_propose_steps, out->n_generated, (int) pos_verify,
-                        i, (int) ids[i], (int) oracle_chain[i], draft.size());
-                break;
-            }
-        }
-
-        const int n_acc = (int) ids.size() - 1;
-        out->n_accepted += n_acc;
-
-        if (getenv("DSPARK_DEBUG")) {
-            fprintf(stderr, "\n[step %2d] anchor='%s'\n", out->n_propose_steps,
-                    common_token_to_piece(ctx_tgt, id_last, true).c_str());
-            fprintf(stderr, "  proposed (%d):", (int) draft.size());
-            for (auto d : draft) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, d, true).c_str());
-            fprintf(stderr, "\n  accepted %d/%d:", n_acc, (int) draft.size());
-            for (int i = 0; i < n_acc; ++i) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, draft[i], true).c_str());
-            fprintf(stderr, "\n  committed (+bonus):");
-            for (auto t : ids) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, t, true).c_str());
-            fputc('\n', stderr);
-        }
-
-        if (n_acc > 0) {
-            common_speculative_accept(spec, 0, (uint16_t) n_acc);
-        }
-
-        n_past = pos_verify + (int) ids.size();
-        for (auto t : ids) {
-            prompt_tgt.push_back(id_last);
-            id_last = t;
-            out->output.push_back(id_last);
-            out->n_generated++;
-            if (out->n_generated >= n_predict || llama_vocab_is_eog(vocab, id_last)) {
-                break;
-            }
-        }
-
-        if (!getenv("DSPARK_NO_KV_TRIM")) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
-        }
-
-        if (llama_vocab_is_eog(vocab, id_last)) {
-            break;
-        }
-    }
-
-    out->gen_ms = now_ms() - t0;
-    llama_batch_free(batch_tgt);
-    llama_batch_free(prefill);
-    common_speculative_dspark_context_reset(ctx_tgt);
-    if (ctx_dft) {
-        common_speculative_dspark_context_reset(ctx_dft);
-    }
-    return 0;
+    return rc;
 }
 
 static void print_tokens(const char * label, const std::vector<llama_token> & toks, size_t skip) {

@@ -132,7 +132,7 @@ flake.lock
 /wikitext-2-raw/
 /scripts/dspark-vps/eval/qwen3/expected/
 /scripts/dspark-vps/eval/qwen3/runs/
-/scripts/dspark-vps/eval/qwen3/results.csv
+/scripts/dspark-vps/eval/qwen3/*.csv
 
 # Test models for lora adapters
 

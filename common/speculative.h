@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dspark_pipeline.h"
 #include "llama.h"
 #include "common.h"
 
