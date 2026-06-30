@@ -289,8 +289,8 @@ Pipeline refactor does **not** remove commit decodes; it removes illegal KV writ
 ### Phase D - Correctness hardening (2 days)
 
 - [ ] KV asserts (see kv-safety doc)
-- [ ] Row-0 canary + sequential fallback
-- [ ] Fix remaining batched edge cases (code01 @ gen 162) or document as canary fallback
+- [x] Greedy verify defaults to sequential one-token decode (fixes code01 divergence @ gen 162)
+- [ ] Parallel verify opt-in only (`DSPARK_VERIFY_PARALLEL=1`); row logits must match sequential before production use
 
 ### Phase E - Perf follow-ups (ongoing)
 

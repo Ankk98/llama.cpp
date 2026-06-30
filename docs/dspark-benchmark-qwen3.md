@@ -293,20 +293,33 @@ Draft KV (`ctx_dft`) is separate; bug is **target** KV not staying canonical.
 
 ### Fix (`common_speculative_dspark_verify_batched`)
 
-Batched verify runs parallel logits on a **scratch sequence** (`seq_id + 1`):
+**Root cause:** greedy accept used **parallel multi-token target forward** row logits.
+That graph does not guarantee the same greedy chain as **one-token-at-a-time** decode
+(the only correct causal semantics at temp=0). This is a design bug, not a prompt-specific
+edge case.
 
-1. `llama_memory_seq_cp` copies canonical prefix from main seq to scratch (separate KV stream).
-2. Batched forward writes draft positions **only on scratch**; main seq is untouched.
-3. Accept from multi-row logits; discard scratch tail.
-4. Append accepted tokens on main seq via `process_committed(..., kv_append_only=true)`.
+**Default (correct):** `verify_batched()` delegates to **sequential verify** - one target
+decode per token, early exit on draft mismatch, `process()` inline. Matches vanilla.
 
-Requires `n_parallel >= 2` (benchmark harness auto-bumps unless `DSPARK_VERIFY_SEQ=1`).
-Falls back to sequential verify when only one slot. `defer_layer_inp_extract` is off
-during scratch batched forward (defer breaks logits on multi-stream caches).
+**Opt-in (experimental):** `DSPARK_VERIFY_PARALLEL=1` enables parallel multi-row forward
+on a scratch sequence + `process_committed()`. Do not use for production greedy verify
+until row logits are proven equivalent to sequential decode.
 
-Removed: rolling KV snapshot + full prefix re-decode workaround.
+Scratch sequence isolation (for parallel path) prevents draft hypotheticals from touching
+canonical target KV. Requires `n_parallel >= 2` when parallel verify is enabled.
 
-Debug: `DSPARK_TRACE_KV=1`, `DSPARK_VERIFY_SEQ=1` (force sequential).
+Debug: `DSPARK_TRACE_KV=1`, `DSPARK_VERIFY_SEQ=1` (alias for sequential).
+
+### Post-fix validation (CPU/Vulkan, n=200, c=8096, temp=0)
+
+| Prompt | Default verify | `DSPARK_VERIFY_PARALLEL=1` |
+|--------|----------------|----------------------------|
+| `code01_think_off` | **YES** | **NO** @ gen 162 |
+| `agent03_think_on` | **YES** | (not re-run) |
+| `code_500l` | **YES** | (not re-run) |
+
+Parallel path still fails on `code01_think_off` @ gen 162, confirming the diagnosis:
+wrong verify semantics, not a prompt quirk.
 
 ### Trace tooling
 

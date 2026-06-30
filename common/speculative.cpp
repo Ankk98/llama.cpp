@@ -3536,13 +3536,15 @@ static void dspark_trace_batched_vs_sequential_logits(
     (void) first_mismatch_row;
 }
 
-// Batched verify: parallel logits on a scratch sequence; main seq KV stays append-only.
-// Sequential early-exit via DSPARK_VERIFY_SEQ=1.
-bool common_speculative_dspark_verify_batched(
+// Parallel multi-token forward on scratch + accept from row logits.
+// UNSAFE for greedy accept unless row logits match one-token decode (see verify_batched).
+// Opt-in via DSPARK_VERIFY_PARALLEL=1.
+static bool dspark_verify_parallel_scratch(
         common_speculative * spec,
         struct common_sampler * smpl,
         llama_context * ctx_tgt,
         llama_seq_id seq_id,
+        llama_seq_id scratch_seq,
         llama_pos pos_verify,
         llama_token anchor,
         const llama_tokens & draft,
@@ -3552,21 +3554,6 @@ bool common_speculative_dspark_verify_batched(
         const std::vector<std::vector<float>> * draft_probs,
         float temp) {
     out_ids.clear();
-
-    if (spec == nullptr || smpl == nullptr || ctx_tgt == nullptr) {
-        return false;
-    }
-
-    if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
-        return common_speculative_dspark_verify_sequential(
-                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-    }
-
-    const llama_seq_id scratch_seq = dspark_verify_scratch_seq_id(ctx_tgt, seq_id);
-    if (scratch_seq == seq_id) {
-        return common_speculative_dspark_verify_sequential(
-                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
-    }
 
     llama_context * ctx_feat = nullptr;
     for (auto & impl : spec->impls) {
@@ -3582,30 +3569,11 @@ bool common_speculative_dspark_verify_batched(
             || getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
             || getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
 
-    // Defer during scratch batched forward breaks logits/KV sync on multi-stream caches.
     const bool defer_layers = !split_verify && !force_committed
             && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr
             && getenv("DSPARK_VERIFY_DEFER_SCRATCH") != nullptr;
 
-    std::vector<uint8_t> trace_pre_snap;
-    static int trace_step = 0;
-    const bool trace_verify = getenv("DSPARK_TRACE_VERIFY") != nullptr;
-    if (trace_verify) {
-        if (!dspark_ctx_save_state(ctx_tgt, trace_pre_snap)) {
-            fprintf(stderr, "DSPARK_TRACE_VERIFY: pre-verify save_state failed\n");
-        }
-    }
-
     llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
-
-    if (getenv("DSPARK_TRACE_KV")) {
-        const llama_pos kv_min = llama_memory_seq_pos_min(mem_tgt, seq_id);
-        const llama_pos kv_max = llama_memory_seq_pos_max(mem_tgt, seq_id);
-        fprintf(stderr,
-                "DSPARK_TRACE_KV: pre-verify step=%d pos_verify=%d main kv_min=%d kv_max=%d "
-                "(expect kv_max==pos_verify-1)\n",
-                trace_step + 1, (int) pos_verify, (int) kv_min, (int) kv_max);
-    }
 
     llama_synchronize(ctx_tgt);
     llama_memory_seq_rm(mem_tgt, scratch_seq, 0, -1);
@@ -3635,7 +3603,6 @@ bool common_speculative_dspark_verify_batched(
         dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, scratch_seq);
     }
 
-    // Layer taps on during scratch forward (matches sequential verify; logits differ when off).
     common_speculative_dspark_target_features_enable(spec, true);
 
     if (defer_layers) {
@@ -3646,28 +3613,10 @@ bool common_speculative_dspark_verify_batched(
         if (defer_layers) {
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
-        common_speculative_dspark_target_features_enable(spec, true);
         return false;
     }
 
     const int64_t t_decode = timing ? ggml_time_us() : 0;
-
-    if (trace_verify && !trace_pre_snap.empty()) {
-        ++trace_step;
-        const char * only_step = getenv("DSPARK_TRACE_VERIFY_STEP");
-        const char * gen_env   = getenv("DSPARK_TRACE_VERIFY_GEN");
-        const int gen_index    = gen_env ? atoi(gen_env) : -1;
-        if (!only_step || trace_step == atoi(only_step)) {
-            std::vector<uint8_t> trace_post_snap;
-            if (dspark_ctx_save_state(ctx_tgt, trace_post_snap)) {
-                dspark_trace_batched_vs_sequential_logits(
-                        spec, ctx_tgt, seq_id, pos_verify, anchor, draft, batch,
-                        trace_pre_snap, defer_layers, trace_step, gen_index);
-                dspark_ctx_restore_state(ctx_tgt, trace_post_snap);
-            }
-        }
-    }
-
     const int64_t t1 = timing ? ggml_time_us() : 0;
 
     if (draft_probs != nullptr && !draft_probs->empty()) {
@@ -3705,17 +3654,7 @@ bool common_speculative_dspark_verify_batched(
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
         llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
-        common_speculative_dspark_target_features_enable(spec, true);
         return false;
-    }
-
-    if (getenv("DSPARK_TRACE_KV")) {
-        const llama_pos main_max = llama_memory_seq_pos_max(mem_tgt, seq_id);
-        const llama_pos scratch_max = llama_memory_seq_pos_max(mem_tgt, scratch_seq);
-        fprintf(stderr,
-                "DSPARK_TRACE_KV: post-logits main kv_max=%d scratch kv_max=%d "
-                "out_ids_n=%zu\n",
-                (int) main_max, (int) scratch_max, out_ids.size());
     }
 
     llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
@@ -3737,6 +3676,96 @@ bool common_speculative_dspark_verify_batched(
     }
 
     return true;
+}
+
+// Default verify: one target decode per token, early exit on draft mismatch, process() inline.
+// This is the only correct greedy semantics at temp=0 (matches vanilla target-only decode).
+//
+// Parallel multi-token forward + multi-row accept is opt-in (DSPARK_VERIFY_PARALLEL=1) and
+// must not be used for production greedy verify: row logits from a parallel graph are not
+// guaranteed to match the one-token-at-a-time chain (causal KV accumulation differs).
+bool common_speculative_dspark_verify_batched(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        llama_batch & batch,
+        common_speculative_dspark_verify_timing * timing,
+        const std::vector<std::vector<float>> * draft_probs,
+        float temp) {
+    out_ids.clear();
+
+    if (spec == nullptr || smpl == nullptr || ctx_tgt == nullptr) {
+        return false;
+    }
+
+    // Legacy alias for sequential verify.
+    if (getenv("DSPARK_VERIFY_SEQ") != nullptr) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+
+    const bool pure_greedy = draft_probs == nullptr
+            && (temp == 0.0f || temp == -1.0f)
+            && common_sampler_is_pure_greedy(smpl);
+
+    // Greedy verify MUST use sequential one-token decode. Parallel multi-row accept reads
+    // logits from a graph that does not reproduce per-step causal KV build.
+    if (pure_greedy && getenv("DSPARK_VERIFY_PARALLEL") == nullptr) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+
+    const llama_seq_id scratch_seq = dspark_verify_scratch_seq_id(ctx_tgt, seq_id);
+    if (scratch_seq == seq_id) {
+        return common_speculative_dspark_verify_sequential(
+                spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
+    }
+
+    std::vector<uint8_t> trace_pre_snap;
+    static int trace_step = 0;
+    const bool trace_verify = getenv("DSPARK_TRACE_VERIFY") != nullptr;
+    if (trace_verify) {
+        if (!dspark_ctx_save_state(ctx_tgt, trace_pre_snap)) {
+            fprintf(stderr, "DSPARK_TRACE_VERIFY: pre-verify save_state failed\n");
+        }
+    }
+
+    if (getenv("DSPARK_TRACE_KV")) {
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        const llama_pos kv_min = llama_memory_seq_pos_min(mem_tgt, seq_id);
+        const llama_pos kv_max = llama_memory_seq_pos_max(mem_tgt, seq_id);
+        fprintf(stderr,
+                "DSPARK_TRACE_KV: pre-verify step=%d pos_verify=%d main kv_min=%d kv_max=%d "
+                "(expect kv_max==pos_verify-1)\n",
+                trace_step + 1, (int) pos_verify, (int) kv_min, (int) kv_max);
+    }
+
+    const bool ok = dspark_verify_parallel_scratch(
+            spec, smpl, ctx_tgt, seq_id, scratch_seq, pos_verify, anchor, draft,
+            out_ids, batch, timing, draft_probs, temp);
+
+    if (trace_verify && !trace_pre_snap.empty()) {
+        ++trace_step;
+        const char * only_step = getenv("DSPARK_TRACE_VERIFY_STEP");
+        const char * gen_env   = getenv("DSPARK_TRACE_VERIFY_GEN");
+        const int gen_index    = gen_env ? atoi(gen_env) : -1;
+        if (!only_step || trace_step == atoi(only_step)) {
+            std::vector<uint8_t> trace_post_snap;
+            if (dspark_ctx_save_state(ctx_tgt, trace_post_snap)) {
+                dspark_trace_batched_vs_sequential_logits(
+                        spec, ctx_tgt, seq_id, pos_verify, anchor, draft, batch,
+                        trace_pre_snap, false, trace_step, gen_index);
+                dspark_ctx_restore_state(ctx_tgt, trace_post_snap);
+            }
+        }
+    }
+
+    return ok;
 }
 
 // Sequential early-exit target verify: one token per decode, stop at first draft mismatch.

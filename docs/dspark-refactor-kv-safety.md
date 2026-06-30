@@ -23,7 +23,10 @@ Scratch-sequence batched verify (`seq_id + 1`):
 3. Accept from logits; discard scratch tail
 4. Append accepted tokens on main seq via `process_committed(..., kv_append_only=true)`
 
-This restores the invariant on seq 0 but still shares one `llama_context`, relies on `n_parallel >= 2`, and batched logits can still diverge from one-token decode on edge prompts (e.g. `code01_think_off` @ gen 162). Sequential verify (`DSPARK_VERIFY_SEQ=1`) remains the correctness backstop.
+This restores the invariant on seq 0 for the parallel path. **Greedy accept must use
+sequential one-token decode** (default in `verify_batched()`); parallel multi-row accept
+is opt-in via `DSPARK_VERIFY_PARALLEL=1` and is incorrect for production until row logits
+match sequential decode chain.
 
 ---
 

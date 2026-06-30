@@ -113,7 +113,7 @@ bool common_speculative_dspark_process_committed(
         struct llama_batch & batch,
         bool kv_append_only = false);
 
-// DSpark: batched verify (parallel logits on scratch seq, append committed tokens to main seq)
+// DSpark: target verify entry point. Default sequential (correct at temp=0); parallel opt-in via DSPARK_VERIFY_PARALLEL=1
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,

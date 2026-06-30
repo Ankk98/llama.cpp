@@ -735,8 +735,8 @@ int main(int argc, char ** argv) {
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
-    if (use_dspark_spec && params.n_parallel < 2 && getenv("DSPARK_VERIFY_SEQ") == nullptr) {
-        fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
+    if (use_dspark_spec && params.n_parallel < 2 && getenv("DSPARK_VERIFY_PARALLEL") != nullptr) {
+        fprintf(stderr, "note: DSpark parallel verify needs n_parallel >= 2; using 2\n");
         params.n_parallel = 2;
     }
 
