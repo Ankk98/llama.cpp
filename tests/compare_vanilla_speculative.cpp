@@ -137,7 +137,7 @@ static int run_speculative(
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     // warmup target graphs at verify batch size (n_max + 1 tokens)
-    {
+    if (!getenv("DSPARK_NO_WARMUP")) {
         const int32_t n_verify = params.speculative.draft.n_max + 1;
         llama_batch warm = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
         const llama_token warm_tok = inp.empty() ? 0 : inp[0];
@@ -179,12 +179,16 @@ static int run_speculative(
     if (ctx_feat) {
         llama_decode(ctx_feat, prefill);
     }
-    if (prefill_defer) {
-        llama_commit_layer_inputs(ctx_prefill, inp.size());
-        llama_set_defer_layer_inp_extract(ctx_prefill, false);
+        if (prefill_defer) {
+            llama_commit_layer_inputs(ctx_prefill, inp.size());
+            llama_set_defer_layer_inp_extract(ctx_prefill, false);
+        }
+        if (!getenv("DSPARK_NO_PREFILL_PROCESS")) {
+            common_speculative_process(spec, prefill);
+        }
+    if (!getenv("DSPARK_NO_BEGIN")) {
+        common_speculative_begin(spec, 0, prompt_tgt);
     }
-    common_speculative_process(spec, prefill);
-    common_speculative_begin(spec, 0, prompt_tgt);
 
     llama_token id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
     common_sampler_accept(smpl, id_last, true);
@@ -210,32 +214,34 @@ static int run_speculative(
         common_speculative_sync_params(spec, spec_params);
 
         draft.clear();
-        common_speculative_get_draft_params(spec, 0) = {
-            true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
-        };
-        const double td0 = now_ms();
-        common_speculative_draft(spec);
-        out->draft_ms += now_ms() - td0;
+        if (!getenv("DSPARK_NO_DRAFT")) {
+            common_speculative_get_draft_params(spec, 0) = {
+                true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
+            };
+            const double td0 = now_ms();
+            common_speculative_draft(spec);
+            out->draft_ms += now_ms() - td0;
+        }
 
         out->n_propose_steps++;
         out->n_drafted += (int) draft.size();
 
         const llama_pos pos_verify = n_past;
         llama_tokens ids;
-        if (getenv("DSPARK_VERIFY_SEQ")) {
-            const double tv0 = now_ms();
-            if (!common_speculative_dspark_verify_sequential(
-                    spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt)) {
-                fprintf(stderr, "error: dspark sequential verify failed\n");
-                return 1;
-            }
-            out->tgt_decode_ms += now_ms() - tv0;
-            out->verify_ms += now_ms() - tv0;
+        const double tv0 = now_ms();
+
+        if (getenv("DSPARK_VANILLA_VERIFY")) {
+            common_batch_clear(batch_tgt);
+            common_batch_add(batch_tgt, id_last, pos_verify, { 0 }, true);
+            llama_decode(ctx_tgt, batch_tgt);
+            const llama_token next = common_sampler_sample(smpl, ctx_tgt, -1, false);
+            common_sampler_accept(smpl, next, true);
+            ids.assign(1, next);
         } else {
             common_speculative_dspark_verify_timing vtim {};
             if (!common_speculative_dspark_verify_batched(
                     spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt, &vtim)) {
-                fprintf(stderr, "error: dspark batched verify failed\n");
+                fprintf(stderr, "error: dspark verify failed\n");
                 return 1;
             }
             out->tgt_decode_ms     += vtim.logits_decode_ms + vtim.features_decode_ms;
@@ -244,8 +250,9 @@ static int run_speculative(
             out->verify_features_ms += vtim.features_decode_ms;
             out->verify_process_ms += vtim.process_ms;
             out->verify_decode_submit_ms += vtim.decode_submit_ms;
-            out->verify_ms += vtim.decode_submit_ms + vtim.accept_ms + vtim.layer_commit_ms + vtim.process_ms;
         }
+
+        out->verify_ms += now_ms() - tv0;
 
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
@@ -262,20 +269,25 @@ static int run_speculative(
             fputc('\n', stderr);
         }
 
-        common_speculative_accept(spec, 0, (uint16_t) n_acc);
+        if (n_acc > 0) {
+            common_speculative_accept(spec, 0, (uint16_t) n_acc);
+        }
+
         n_past = pos_verify + (int) ids.size();
         for (auto t : ids) {
             prompt_tgt.push_back(id_last);
             id_last = t;
             out->output.push_back(id_last);
             out->n_generated++;
-            if (llama_vocab_is_eog(vocab, id_last)) {
+            if (out->n_generated >= n_predict || llama_vocab_is_eog(vocab, id_last)) {
                 break;
             }
         }
 
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
-        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
+        if (!getenv("DSPARK_NO_KV_TRIM")) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
+        }
 
         if (llama_vocab_is_eog(vocab, id_last)) {
             break;

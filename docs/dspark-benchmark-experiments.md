@@ -3,7 +3,9 @@
 Living log for DSpark speculative decoding performance on llama.cpp.
 **Fair methodology only** - numbers below use vanilla-first + 3s cooldown unless noted.
 
-**NVIDIA CUDA results:** see [dspark-benchmark-nvidia.md](dspark-benchmark-nvidia.md) (RTX 3090, ~2.0x coding speedup).
+**NVIDIA CUDA results:** see [dspark-benchmark-nvidia.md](dspark-benchmark-nvidia.md) (RTX 3090). Post-fix (2026-06-29): sequential verify restores token match on CUDA (~0.90x); batched verify still diverges at gen 54+.
+
+**Upstream vLLM comparison:** see [dspark-vllm-pr46995-comparison.md](dspark-vllm-pr46995-comparison.md).
 
 ## Environment
 
@@ -52,8 +54,10 @@ DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/compare_vanilla_speculative \
 | `DSPARK_GPU_GREEDY=1` | Opt-in GPU argmax accept (experimental; default off) |
 | `DSPARK_NO_GPU_GREEDY=1` | Force CPU greedy accept (default path) |
 | `DSPARK_FUSED_ARGMAX=1` | In-graph per-row argmax (experimental; match NO on Vulkan) |
-| `DSPARK_VERIFY_SEQ=1` | Sequential early-exit verify (slower, match NO) |
-| `DSPARK_NO_DEFER_LAYER_INP=1` | Full layer D2H on every verify row (slower) |
+| `DSPARK_VERIFY_SEQ=1` | Force sequential verify (CUDA default for temp=0) |
+| `DSPARK_VERIFY_BATCHED=1` | Opt-in batched verify (CUDA temp=0: diverges gen 54+) |
+| `DSPARK_PREFILL_DEFER=1` | Defer layer D2H during spec prefill (match YES on CUDA) |
+| `DSPARK_FAST_PREFILL=1` | Two-pass n-1 prefill (experimental; match NO, slower pp on CUDA) |
 
 ### Safe profiling (avoid OOM)
 
@@ -259,10 +263,12 @@ done
 
 ## Open work (structural, ordered by impact)
 
-1. **Faster 5-token target forward** - llama graph reuse audit, Vulkan small-batch matmul, fused per-row argmax in graph (skip logits D2H; saves little if forward dominates)
-2. **Higher coding acceptance** - draft model / Q4 numerics; n_max>4 hurts match
-3. **Fix GPU greedy path** - cached argmax graph, correct row stride; opt-in only
-4. **Agentic acceptance** - prompt-class limiter, not verify ms
+1. **CUDA batched multi-token verify correctness** - sequential fallback works but ~0.90x; batched gives ~1.0x throughput but wrong greedy at gen 54+. KV tail trim and `-fa 0` insufficient; needs llama.cpp CUDA decode fix.
+2. **Faster 5-token target forward** - llama graph reuse audit, Vulkan small-batch matmul, fused per-row argmax in graph (skip logits D2H; saves little if forward dominates)
+3. **Higher coding acceptance** - draft model / Q4 numerics; n_max>4 hurts match
+4. **Fix GPU greedy path** - cached argmax graph, correct row stride; opt-in only
+5. **Agentic acceptance** - prompt-class limiter, not verify ms
+6. **Spec prefill speed on CUDA** - `DSPARK_PREFILL_DEFER=1` wired in compare harness (match YES, ~0.38x pp). `DSPARK_FAST_PREFILL=1` breaks match @ gen 34 and is slower (~0.21x pp); not recommended.
 
 ## How to append results
 

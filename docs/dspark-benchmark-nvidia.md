@@ -79,40 +79,36 @@ Draft and verify step times in DSpark track these isolated numbers closely.
 
 ---
 
-## Fair throughput results (2026-06-29)
+## Fair throughput results (2026-06-29, post-fix)
 
 Default: `-c 512`, `temp=0`, `seed=42`, `n_max=4`, `DSPARK_NO_ADAPTIVE_NMAX=1`, vanilla-first.
+CUDA default verify: **sequential** (batched opt-in via `DSPARK_VERIFY_BATCHED=1`).
 
 ### Coding (`code_500l`, n=400)
 
-| Config | tgp van | tgp spec | **Speedup** | Accept/step | Draft ms | Verify ms | Match |
-|--------|---------|----------|-------------|-------------|----------|-----------|-------|
-| **Default CUDA** | 88.5 | **177.1** | **2.00x** | 2.60 | 4.2 | 16.3 | NO* |
-| `-c 1024` | 88.4 | 176.6 | 2.00x | 2.60 | 4.2 | 16.3 | NO |
-| No defer layer | 88.3 | 176.0 | 1.99x | 2.60 | 4.2 | 16.3 | NO |
-| Draft CPU (`-ngld 0`) | 88.3 | 38.0 | 0.43x | 2.54 | 73.2 | 20.7 | NO |
-| Target+Draft CPU (`-ngl 0 -ngld 0`) | 88.3 | 174.0 | 1.97x | 2.45 | 80.6 | 256.0 | NO |
+| Config | tgp van | tgp spec | **Speedup** | Accept/step | Match |
+|--------|---------|----------|-------------|-------------|-------|
+| **Default (sequential verify)** | ~88 | ~80 | **~0.90x** | 2.54 | **YES** |
+| `DSPARK_VERIFY_BATCHED=1` + defer | ~88 | ~88 | ~1.00x | 2.54 | NO @ gen 54 |
+| Pre-fix batched (committed) | 88.5 | 177.1 | 2.00x | 2.60 | NO @ gen 34 |
 
-\*First mismatch at **generated token index 34** (`vanilla=13740`, `spec=24767`). First 34 tokens identical.
+Sequential verify is correct but slower than batched multi-token forward (~16 ms vs ~4x per step).
+Batched path still diverges on CUDA (gen 54: vanilla=108, spec=107); `-fa 0` does not fix it.
 
-### Other coding prompts (n=200, n_max=4)
+### Other coding prompts (n=300, sequential default)
 
-| Prompt | Speedup | Accept/step | Token match | Notes |
-|--------|---------|-------------|-------------|-------|
-| `code_fib.json` | 1.98x | 2.59 | **YES** | |
-| `code_sql.json` | 1.98x | 2.54 | NO | mismatch @ index 29 |
-| `code_bug.json` | 1.95x | 2.49 | NO | mismatch @ index 109 |
-| `code_500l.json` | 2.00x | 2.60 | NO | mismatch @ index 34 |
+| Prompt | Speedup | Accept/step | Token match |
+|--------|---------|-------------|-------------|
+| `code_fib.json` | ~0.89x | 2.76 | **YES** |
+| `code_500l.json` | ~0.90x | 2.54 | **YES** |
 
-Token match is **prompt-dependent on CUDA**. Not all prompts diverge from vanilla greedy.
+### Agentic (`agentic_plan`, n=300, sequential default)
 
-### Agentic (`agentic_plan`, n=300)
+| n_max | Speedup | Accept/step | Match |
+|-------|---------|-------------|-------|
+| 4 | ~0.88x | 1.85 | **YES** |
 
-| n_max | tgp van | tgp spec | Speedup | Accept/step | Verify ms | Match |
-|-------|---------|----------|---------|-------------|-----------|-------|
-| 4 | 88.6 | 135.4 | **1.53x** | 1.75 | 16.2 | NO |
-
-Agentic acceptance ~1.75/step (vs ~1.3-1.6 on Vulkan). CUDA hits the 1.5x agentic target.
+Pre-fix batched agentic was ~1.53x but token match NO. Sequential restores correctness at cost of speed.
 
 ### n_max sweep (`code_500l`, n=400)
 
@@ -145,9 +141,9 @@ Same pattern as Vulkan: confidence on adds full-block draft cost (~24 ms vs ~4 m
 | 5-token batched forward | ~70 ms | ~16 ms | **4.4x** |
 | DSpark verify step | ~63-69 ms | ~16 ms | **~4x** |
 | DSpark draft step | ~19 ms | ~4 ms | **~5x** |
-| **Fair coding speedup** | **1.57-1.66x** | **2.00x** | **~1.2x** |
-| Accept/step (code_500l) | 2.50 | 2.60 | similar |
-| Token match (code_500l) | YES | NO @ index 34 | see below |
+| **Fair coding speedup** | **1.57-1.66x** | **~0.90x (seq)** / ~2.0x (batched, wrong) | see below |
+| Accept/step (code_500l) | 2.50 | 2.54 | similar |
+| Token match (code_500l) | YES | **YES (seq)** / NO @ gen 54 (batched) | sequential fix |
 
 CUDA is fast enough that draft+verify overhead is small relative to vanilla TG (~11 ms/token vanilla vs ~5.6 ms/token effective spec). Speedup approaches **2x** (theoretical max with ~2.6 accept/step and similar per-step cost).
 
@@ -170,28 +166,62 @@ Short-prompt DeepSpec reference match **passes on CUDA**.
 
 ### Harness token match vs vanilla
 
-**Fixed (2026-06-29):** CUDA builds default to sequential target verify inside `verify_batched()` (batched multi-token forward diverged). Compare harness uses aligned full-prompt vanilla prefill on CUDA only (`GGML_USE_CUDA`).
+**Fixed (2026-06-29):** CUDA builds default to sequential target verify inside `verify_batched()` (batched multi-token forward diverges). Compare harness uses aligned full-prompt vanilla prefill on all backends.
 
 On `code_500l`, n=400, temp=0, RTX 3090:
 
 | Config | Match | tgp speedup |
 |--------|-------|-------------|
 | Default (sequential verify + aligned vanilla) | **YES** | **0.90x** |
-| `DSPARK_VERIFY_BATCHED=1` (batched verify) | NO @ index 54 | ~0.25x |
+| `DSPARK_VERIFY_BATCHED=1` (CUDA batched) | NO @ gen 54 | ~1.00x |
+| `DSPARK_VERIFY_BATCHED=1` + `-fa 0` | NO @ gen 54 | ~0.82x |
 
 Vulkan (Strix Halo): batched defer verify + standard vanilla prefill, **YES** n=400, ~1.13x.
 
 Opt-in: `DSPARK_VERIFY_BATCHED=1` (CUDA batched), `DSPARK_VERIFY_DEFER=1` (defer fast path), `DSPARK_PREFILL_DEFER=1` (prefill layer defer).
 
+### Batched logits repro (P0)
+
+`tests/smoke_batched_logits_repro.cpp` isolates the CUDA batched-verify bug:
+
+1. Run DSpark with **sequential** verify to a target step (default `--gen-index 54`).
+2. Snapshot target KV with `llama_state_get_data`.
+3. Compare **row-0 greedy** from single-token decode vs multi-token batched decode on the same KV.
+4. Compare per-row: incremental single-token chain vs batched rows 0..n_max.
+5. Run full `verify_sequential` vs `verify_batched` on the snapshot.
+
+```bash
+# Find first step where row-0 single vs multi diverges
+DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/smoke_batched_logits_repro \
+  -m /root/models/target.gguf -md /root/models/draft.gguf \
+  --input-ids /root/dspark_eval/code_500l.json --spec-type draft-dspark \
+  -c 512 -ngl 99 -ngld 99 --temp 0 --seed 42 --spec-draft-n-max 4 -n 400 --scan-all
+
+# Deep dive at gen index 54 (known mismatch with batched verify)
+DSPARK_NO_ADAPTIVE_NMAX=1 ./build/bin/smoke_batched_logits_repro \
+  -m /root/models/target.gguf -md /root/models/draft.gguf \
+  --input-ids /root/dspark_eval/code_500l.json --spec-type draft-dspark \
+  -c 512 -ngl 99 -ngld 99 --temp 0 --seed 42 --spec-draft-n-max 4 --gen-index 54
+```
+
+**Interpretation:**
+
+| Result | Likely cause |
+|--------|----------------|
+| Row-0 single == multi | Bug is not in forward logits; check accept/trim/process |
+| Row-0 single != multi | CUDA multi-token forward corrupts row-0 (causal mask / FA / graph) |
+| Row-0 matches, row-k mismatches | Batched row-k uses wrong KV relative to incremental decode |
+| `--scan-all` first mismatch step << 54 | Earlier KV drift; gen 54 is symptom not root step |
+
 ---
 
 ## Observations
 
-1. **CUDA removes the verify bottleneck.** On Vulkan, verify (~63 ms) dominated; on RTX 3090 verify (~16 ms) is comparable to draft (~4 ms). Further speedup needs higher acceptance or lower vanilla baseline (already ~88 tgp).
-2. **~2x is near the ceiling** for this accept rate (~2.6/step) without quality loss or longer proposals.
-3. **Confidence scheduling** still not worth it on Q4 CUDA (draft cost 6x when enabled).
-4. **`-c 512` vs `1024`** has negligible impact on CUDA for this short prompt (unlike Vulkan where KV length hurt verify).
-5. **Defer layer** saves little when verify is already fast (~16 ms); impact within noise.
+1. **CUDA batched verify blocked.** Multi-token target forward on CUDA produces wrong greedy logits on long runs (gen 54+). KV tail trim and `-fa 0` do not fix. Sequential verify is correct (~0.90x) but loses batched speed. Needs llama.cpp CUDA multi-token decode investigation.
+2. **CUDA removes the verify bottleneck (when batched works).** On Vulkan verify (~63 ms) dominates; on RTX 3090 batched verify (~16 ms) is comparable to draft (~4 ms).
+3. **~2x was near ceiling with batched verify** but batched is not yet correct on CUDA.
+4. **Confidence scheduling** still not worth it on Q4 CUDA (draft cost 6x when enabled).
+5. **`-c 512` vs `1024`** has negligible impact on CUDA for this short prompt (unlike Vulkan where KV length hurt verify).
 6. **Draft on CPU** (`-ngld 0`) destroys speedup (0.43x) - keep draft on GPU.
 
 ---
@@ -202,8 +232,8 @@ Opt-in: `DSPARK_VERIFY_BATCHED=1` (CUDA batched), `DSPARK_VERIFY_DEFER=1` (defer
 |------|-----|--------|---|-------|---------|-------------|-------|-------|
 | 2026-06-29 | RTX 3090 | code_500l | 400 | 4 | **0.90x** | ~2.6 | **YES** | sequential verify default |
 | 2026-06-29 | RTX 3090 | code_500l | 400 | 4 | 2.00x | 2.60 | NO@34 | pre-fix batched verify |
-| 2026-06-29 | RTX 3090 | code_fib | 200 | 4 | 1.98x | 2.59 | YES | |
-| 2026-06-29 | RTX 3090 | agentic_plan | 300 | 4 | 1.53x | 1.75 | NO | hits 1.5x target |
+| 2026-06-29 | RTX 3090 | code_fib | 300 | 4 | ~0.89x | 2.76 | **YES** | sequential default |
+| 2026-06-29 | RTX 3090 | agentic_plan | 300 | 4 | ~0.88x | 1.85 | **YES** | sequential default |
 | 2026-06-29 | RTX 3090 | Phase 3a ref | 32 | 7 | - | - | ref OK | smoke pass |
 
 ---

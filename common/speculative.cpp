@@ -3380,19 +3380,29 @@ bool common_speculative_dspark_process_committed(
     common_speculative_dspark_target_features_enable(spec, true);
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
 
-    dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, committed_ids);
+    // One token per decode to match vanilla KV accumulation (batched re-decode can
+    // diverge on some backends after many steps).
+    for (size_t i = 0; i < committed_ids.size(); ++i) {
+        const llama_token tok_in = (i == 0) ? anchor : committed_ids[i - 1];
 
-    if (llama_decode(ctx_tgt, batch) != 0) {
-        return false;
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_in, pos_verify + (llama_pos) i, { seq_id }, true);
+
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            return false;
+        }
+
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
     }
 
-    return common_speculative_process(spec, batch);
+    return true;
 }
 
-// Batched verify: one target forward for logits, accept, then feature re-decode on the
-// committed prefix and process() into draft KV. CUDA builds use this path by default
-// (layer taps on multi-token verify graphs diverge from vanilla). Vulkan keeps the defer
-// fast path unless DSPARK_FORCE_VERIFY_COMMITTED=1. Override: DSPARK_VERIFY_DEFER=1 (CUDA).
+// Batched verify entry point. Default path matches server / speculative-simple semantics
+// (batched logits + accept + incremental committed re-decode). Fast defer paths are
+// opt-in via DSPARK_VERIFY_FAST=1; sequential early-exit via DSPARK_VERIFY_SEQ=1.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
@@ -3412,15 +3422,14 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
-#if defined(GGML_USE_CUDA)
-    // Batched multi-token target verify diverges on CUDA; sequential matches vanilla.
-    // Opt in with DSPARK_VERIFY_BATCHED=1. draft_probs (temp>0) still uses batched.
-    if (getenv("DSPARK_VERIFY_BATCHED") == nullptr && (draft_probs == nullptr || draft_probs->empty())) {
+    // Greedy default: sequential verify (matches vanilla longer than batched on Vulkan).
+    // Fast batched/defer paths: DSPARK_VERIFY_FAST=1. Explicit override: DSPARK_VERIFY_SEQ=1.
+    if (getenv("DSPARK_VERIFY_FAST") == nullptr && (draft_probs == nullptr || draft_probs->empty())) {
         return common_speculative_dspark_verify_sequential(
                 spec, smpl, ctx_tgt, seq_id, pos_verify, anchor, draft, out_ids, batch);
     }
-#endif
 
+    // Fast paths below (defer / split verify) are opt-in via DSPARK_VERIFY_FAST=1.
     llama_context * ctx_feat = nullptr;
     for (auto & impl : spec->impls) {
         if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
@@ -3430,15 +3439,15 @@ bool common_speculative_dspark_verify_batched(
 
     const bool split_verify = ctx_feat != nullptr && getenv("DSPARK_NO_SPLIT_VERIFY") == nullptr;
 
-#if defined(GGML_USE_CUDA)
-    const bool force_committed = getenv("DSPARK_VERIFY_DEFER") == nullptr;
-#else
-    const bool force_committed = getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
+    const bool force_committed = getenv("DSPARK_VERIFY_DEFER") == nullptr
+            || getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
             || getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
-#endif
 
     const bool defer_layers = !split_verify && !force_committed
             && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
+
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify, -1);
 
     common_batch_clear(batch);
     common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
@@ -3518,6 +3527,10 @@ bool common_speculative_dspark_verify_batched(
         return false;
     }
 
+    // Drop rejected draft tail left in KV by the batched forward; sequential verify
+    // never writes these cells. Keeping them caused CUDA divergence on long runs.
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+
     if (defer_layers) {
         const int64_t t_commit = timing ? ggml_time_us() : 0;
 
@@ -3530,7 +3543,7 @@ bool common_speculative_dspark_verify_batched(
             timing->features_decode_ms = 0;
         }
 
-        batch.n_tokens = (int32_t) out_ids.size();
+        dspark_build_committed_batch(batch, seq_id, pos_verify, anchor, out_ids);
         const int64_t t3 = timing ? ggml_time_us() : 0;
         if (!common_speculative_process(spec, batch)) {
             return false;
@@ -3561,7 +3574,6 @@ bool common_speculative_dspark_verify_batched(
             timing->features_decode_ms = 1e-3 * (ggml_time_us() - t2);
         }
 
-        batch.n_tokens = (int32_t) out_ids.size();
         const int64_t t3 = timing ? ggml_time_us() : 0;
         if (!common_speculative_process(spec, batch)) {
             return false;
