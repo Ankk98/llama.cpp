@@ -143,8 +143,8 @@ static void write_json_results(
     };
 
     fprintf(f, "{");
-    fprintf(f, "\"temp\":%.4f,\"seed\":%u,\"n_predict\":%d,\"n_prompt_tokens\":%zu,",
-            params.sampling.temp, params.sampling.seed, params.n_predict, n_inp);
+    fprintf(f, "\"temp\":%.4f,\"seed\":%u,\"n_predict\":%d,\"n_prompt_tokens\":%zu,\"n_ctx\":%d,",
+            params.sampling.temp, params.sampling.seed, params.n_predict, n_inp, params.n_ctx);
     fprintf(f, "\"confidence_threshold\":%.6f,\"n_max\":%d,",
             params.speculative.dspark_confidence_threshold,
             params.speculative.draft.n_max);
@@ -238,6 +238,152 @@ static int run_vanilla(
     out->gen_ms = now_ms() - t0;
     llama_batch_free(batch);
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    return 0;
+}
+
+static bool params_use_dspark_spec(const common_params & params) {
+    for (auto t : params.speculative.types) {
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool verify_standard_batched(
+        common_speculative * spec,
+        common_sampler * smpl,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        llama_batch & batch) {
+    out_ids.clear();
+
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify, -1);
+
+    common_batch_clear(batch);
+    common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
+    for (size_t i = 0; i < draft.size(); ++i) {
+        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_id }, true);
+    }
+
+    if (llama_decode(ctx_tgt, batch) != 0) {
+        return false;
+    }
+
+    if (spec != nullptr) {
+        common_speculative_process(spec, batch);
+    }
+
+    out_ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+    if (out_ids.empty()) {
+        return false;
+    }
+
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+    return true;
+}
+
+// Generic speculative loop (draft-mtp, draft-simple, etc.) without DSpark verify/process.
+static int run_speculative_standard(
+        common_params & params,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_sampler * smpl,
+        common_speculative * spec,
+        std::vector<llama_token> & inp,
+        int n_predict,
+        run_stats * out) {
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+
+    llama_tokens prompt_tgt(inp.begin(), inp.end());
+    int n_past = (int) inp.size();
+
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    llama_batch prefill   = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+
+    for (size_t i = 0; i < inp.size(); ++i) {
+        common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, i + 1 == inp.size());
+    }
+    out->n_prompt = (int) inp.size();
+    const double tpp = now_ms();
+    llama_decode(ctx_tgt, prefill);
+    common_speculative_process(spec, prefill);
+    common_speculative_begin(spec, 0, prompt_tgt);
+
+    llama_token id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
+    common_sampler_accept(smpl, id_last, true);
+    out->pp_ms = now_ms() - tpp;
+
+    out->output = inp;
+    out->output.push_back(id_last);
+    out->n_generated = 1;
+
+    llama_tokens draft;
+    const double t0 = now_ms();
+
+    while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
+        draft.clear();
+        common_speculative_get_draft_params(spec, 0) = {
+            true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
+        };
+        const double td0 = now_ms();
+        common_speculative_draft(spec);
+        out->draft_ms += now_ms() - td0;
+
+        out->n_propose_steps++;
+        out->n_drafted += (int) draft.size();
+
+        const llama_pos pos_verify = n_past;
+        llama_tokens ids;
+        const double tv0 = now_ms();
+
+        if (!verify_standard_batched(spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt)) {
+            fprintf(stderr, "error: standard verify failed\n");
+            return 1;
+        }
+
+        out->verify_ms += now_ms() - tv0;
+
+        const int n_acc = (int) ids.size() - 1;
+        out->n_accepted += n_acc;
+
+        if (n_acc > 0) {
+            common_speculative_accept(spec, 0, (uint16_t) n_acc);
+        }
+
+        n_past = pos_verify + (int) ids.size();
+        for (auto t : ids) {
+            prompt_tgt.push_back(id_last);
+            id_last = t;
+            out->output.push_back(id_last);
+            out->n_generated++;
+            if (out->n_generated >= n_predict || llama_vocab_is_eog(vocab, id_last)) {
+                break;
+            }
+        }
+
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
+        }
+
+        if (llama_vocab_is_eog(vocab, id_last)) {
+            break;
+        }
+    }
+
+    out->gen_ms = now_ms() - t0;
+    llama_batch_free(batch_tgt);
+    llama_batch_free(prefill);
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    if (ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    }
     return 0;
 }
 
@@ -491,18 +637,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // n_ctx=0 loads the model's trained context (262144 for Gemma4/DSpark) and allocates
-    // a full KV cache for both target and draft, which OOMs on typical GPUs.
+    // n_ctx=0 loads the model's trained context and allocates a full KV cache (OOM risk).
     if (params.n_ctx == 0) {
-        params.n_ctx = 512;
+        params.n_ctx = 8096;
         fprintf(stderr, "note: defaulting context to %d (pass -c to override)\n", params.n_ctx);
     }
 
     const bool has_draft = !bflags.vanilla_only && !params.speculative.draft.mparams.path.empty();
-    if (has_draft) {
+    if (has_draft && params.speculative.types.empty()) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
-        // keep params.speculative.draft.n_max from --spec-draft-n-max (default 4)
     }
+    const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -534,7 +679,7 @@ int main(int argc, char ** argv) {
         ctx_dft.reset(llama_init_from_model(model_dft.get(), common_context_params_to_llama(params_dft)));
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = ctx_dft.get();
-        if (!getenv("DSPARK_NO_SPLIT_VERIFY") && getenv("DSPARK_SPLIT_VERIFY")) {
+        if (!getenv("DSPARK_NO_SPLIT_VERIFY") && getenv("DSPARK_SPLIT_VERIFY") && use_dspark_spec) {
             llama_context_params cparams_feat = common_context_params_to_llama(params);
             cparams_feat.ctx_other = ctx_tgt;
             ctx_tgt_feat.reset(llama_init_from_model(
@@ -598,7 +743,11 @@ int main(int argc, char ** argv) {
             }
         }
         common_sampler_reset(smpl.get());
-        if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+        if (use_dspark_spec) {
+            if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+                return 1;
+            }
+        } else if (run_speculative_standard(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
             return 1;
         }
         have_spec = true;
@@ -624,7 +773,8 @@ int main(int argc, char ** argv) {
     }
 
     if (have_spec) {
-        fprintf(stderr, "\n=== Speculative (draft-dspark) ===\n");
+        fprintf(stderr, "\n=== Speculative (%s) ===\n",
+                use_dspark_spec ? "draft-dspark" : common_speculative_type_to_str(params.speculative.types[0]).c_str());
         fprintf(stderr, "prompt: %d tokens, pp+setup %.1f ms (%.2f tok/s)\n",
                 spec_stats.n_prompt, spec_stats.pp_ms,
                 spec_stats.pp_ms > 0 ? 1000.0 * spec_stats.n_prompt / spec_stats.pp_ms : 0.0);

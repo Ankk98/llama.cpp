@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Qwen3 DSpark benchmark driver.
+Qwen3 benchmark driver: vanilla vs inbuilt MTP vs DSpark.
 
-Runs one model configuration per process (vanilla target-only, then spec target+draft).
-Appends each result row to CSV immediately (line-buffered + fsync).
+Runs one harness process at a time (never two models loaded in parallel).
+Appends each CSV row immediately (line-buffered + fsync).
 
 Phases:
-  1. vanilla-only: save expected output token arrays
-  2. spec-only: compare against reference, sweep confidence + n_max
+  1. vanilla-only (target) -> save expected outputs
+  2. mtp spec-only (target + MTP head), if available
+  3. dspark spec-only (target + DSpark draft), confidence sweep
 """
 
 from __future__ import annotations
@@ -26,37 +27,37 @@ from pathlib import Path
 CSV_FIELDS = [
     "timestamp_utc",
     "git_commit",
+    "decode_mode",
+    "spec_type",
     "run_mode",
     "prompt_id",
     "category",
     "subtype",
     "thinking",
+    "n_ctx",
     "confidence_threshold",
     "n_max",
     "n_predict",
     "n_prompt_tokens",
     "temp",
     "seed",
-    # vanilla (from reference row or same-run)
+    "notes",
     "vanilla_pp_ms",
     "vanilla_gen_ms",
     "vanilla_pp_tok_s",
     "vanilla_tgp_tok_s",
     "vanilla_n_generated",
-  # spec throughput
     "spec_pp_ms",
     "spec_gen_ms",
     "spec_pp_tok_s",
     "spec_tgp_tok_s",
     "spec_n_generated",
     "tgp_speedup_vs_vanilla",
-    # acceptance
     "accept_rate_pct",
     "mean_accepted_per_step",
     "n_propose_steps",
     "n_drafted",
     "n_accepted",
-    # pipeline timing (ms per propose step)
     "ms_draft_step",
     "ms_verify_step",
     "ms_logits_decode",
@@ -71,11 +72,11 @@ CSV_FIELDS = [
     "ms_per_token_vanilla_fwd",
     "draft_ms_total",
     "verify_ms_total",
-    # correctness
     "token_match",
     "first_mismatch_gen",
     "input_ids_path",
     "reference_path",
+    "draft_model_path",
     "json_results_path",
     "harness_exit_code",
 ]
@@ -118,6 +119,39 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def gguf_nextn_layers(path: str) -> int:
+    try:
+        import gguf
+
+        reader = gguf.GGUFReader(path)
+        for key, field in reader.fields.items():
+            if str(key).endswith(".nextn_predict_layers"):
+                return int(field.parts[field.data[0]])
+    except Exception:
+        pass
+    return 0
+
+
+def resolve_mtp_draft(target: str, mtp_draft: str | None) -> str | None:
+    if mtp_draft:
+        p = Path(mtp_draft).expanduser()
+        return str(p) if p.exists() else None
+
+    t = Path(target).expanduser()
+    parent = t.parent
+    for pattern in (f"mtp-{t.name}", f"mtp-{t.stem}.gguf"):
+        cand = parent / pattern
+        if cand.exists():
+            return str(cand)
+    for cand in sorted(parent.glob(f"mtp-*{t.suffix}")):
+        return str(cand)
+
+    # Trunk file with embedded nextn layers still needs a separate mtp-only GGUF for -md.
+    if gguf_nextn_layers(str(t)) > 0:
+        return None
+    return None
+
+
 def run_harness(
     compare_bin: Path,
     *,
@@ -130,8 +164,10 @@ def run_harness(
     vanilla_only: bool,
     spec_only: bool,
     n_predict: int,
+    n_ctx: int,
     n_max: int,
     confidence: float,
+    spec_type: str,
     env: dict[str, str],
     extra_args: list[str],
 ) -> tuple[int, dict | None]:
@@ -146,7 +182,7 @@ def run_harness(
         "--seed",
         "42",
         "-c",
-        "512",
+        str(n_ctx),
         "--device",
         "Vulkan0",
         "-ngl",
@@ -156,12 +192,12 @@ def run_harness(
         "--json-results",
         str(json_results),
         "--spec-type",
-        "draft-dspark",
+        spec_type,
         "--spec-draft-n-max",
         str(n_max),
-        "--dspark-confidence-threshold",
-        str(confidence),
     ]
+    if spec_type == "draft-dspark":
+        cmd.extend(["--dspark-confidence-threshold", str(confidence)])
     if draft:
         cmd.extend(["-md", draft, "-ngld", "99"])
     if vanilla_only:
@@ -199,11 +235,42 @@ def run_harness(
     return proc.returncode, result
 
 
+def base_row(
+    commit: str,
+    prompt: dict,
+    *,
+    decode_mode: str,
+    spec_type: str,
+    run_mode: str,
+    n_predict: int,
+    n_ctx: int,
+    n_max: int,
+    confidence: float,
+    notes: str = "",
+) -> dict:
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": commit,
+        "decode_mode": decode_mode,
+        "spec_type": spec_type,
+        "run_mode": run_mode,
+        "prompt_id": prompt["id"],
+        "category": prompt["category"],
+        "subtype": prompt.get("subtype", ""),
+        "thinking": prompt["thinking"],
+        "n_ctx": n_ctx,
+        "confidence_threshold": confidence,
+        "n_max": n_max,
+        "n_predict": n_predict,
+        "notes": notes,
+    }
+
+
 def vanilla_row_from_json(
     commit: str,
     prompt: dict,
     n_predict: int,
-    confidence: float,
+    n_ctx: int,
     n_max: int,
     j: dict,
     *,
@@ -213,38 +280,46 @@ def vanilla_row_from_json(
     exit_code: int,
 ) -> dict:
     v = j.get("vanilla", {})
-    return {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "git_commit": commit,
-        "run_mode": "vanilla",
-        "prompt_id": prompt["id"],
-        "category": prompt["category"],
-        "subtype": prompt.get("subtype", ""),
-        "thinking": prompt["thinking"],
-        "confidence_threshold": confidence,
-        "n_max": n_max,
-        "n_predict": n_predict,
-        "n_prompt_tokens": j.get("n_prompt_tokens", prompt.get("prompt_tokens", "")),
-        "temp": j.get("temp", 0),
-        "seed": j.get("seed", 42),
-        "vanilla_pp_ms": v.get("pp_ms", ""),
-        "vanilla_gen_ms": v.get("gen_ms", ""),
-        "vanilla_pp_tok_s": v.get("pp_tok_s", ""),
-        "vanilla_tgp_tok_s": v.get("tgp_tok_s", ""),
-        "vanilla_n_generated": v.get("n_generated", ""),
-        "token_match": "true",
-        "first_mismatch_gen": "",
-        "input_ids_path": str(input_ids),
-        "reference_path": str(reference),
-        "json_results_path": str(json_path),
-        "harness_exit_code": exit_code,
-    }
+    row = base_row(
+        commit,
+        prompt,
+        decode_mode="vanilla",
+        spec_type="none",
+        run_mode="vanilla",
+        n_predict=n_predict,
+        n_ctx=n_ctx,
+        n_max=n_max,
+        confidence=0.0,
+    )
+    row.update(
+        {
+            "n_prompt_tokens": j.get("n_prompt_tokens", prompt.get("prompt_tokens", "")),
+            "temp": j.get("temp", 0),
+            "seed": j.get("seed", 42),
+            "vanilla_pp_ms": v.get("pp_ms", ""),
+            "vanilla_gen_ms": v.get("gen_ms", ""),
+            "vanilla_pp_tok_s": v.get("pp_tok_s", ""),
+            "vanilla_tgp_tok_s": v.get("tgp_tok_s", ""),
+            "vanilla_n_generated": v.get("n_generated", ""),
+            "token_match": "true",
+            "first_mismatch_gen": "",
+            "input_ids_path": str(input_ids),
+            "reference_path": str(reference),
+            "draft_model_path": "",
+            "json_results_path": str(json_path),
+            "harness_exit_code": exit_code,
+        }
+    )
+    return row
 
 
 def spec_row_from_json(
     commit: str,
     prompt: dict,
+    decode_mode: str,
+    spec_type: str,
     n_predict: int,
+    n_ctx: int,
     confidence: float,
     n_max: int,
     j: dict,
@@ -252,6 +327,7 @@ def spec_row_from_json(
     *,
     input_ids: Path,
     reference: Path,
+    draft_path: str,
     json_path: Path,
     exit_code: int,
 ) -> dict:
@@ -259,68 +335,75 @@ def spec_row_from_json(
     v_tgp = vanilla_ref.get("vanilla_tgp_tok_s") or 0
     s_tgp = s.get("tgp_tok_s") or 0
     speedup = (float(s_tgp) / float(v_tgp)) if v_tgp and s_tgp else j.get("tgp_speedup", "")
-    return {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "git_commit": commit,
-        "run_mode": "spec",
-        "prompt_id": prompt["id"],
-        "category": prompt["category"],
-        "subtype": prompt.get("subtype", ""),
-        "thinking": prompt["thinking"],
-        "confidence_threshold": confidence,
-        "n_max": n_max,
-        "n_predict": n_predict,
-        "n_prompt_tokens": j.get("n_prompt_tokens", prompt.get("prompt_tokens", "")),
-        "temp": j.get("temp", 0),
-        "seed": j.get("seed", 42),
-        "vanilla_pp_ms": vanilla_ref.get("vanilla_pp_ms", ""),
-        "vanilla_gen_ms": vanilla_ref.get("vanilla_gen_ms", ""),
-        "vanilla_pp_tok_s": vanilla_ref.get("vanilla_pp_tok_s", ""),
-        "vanilla_tgp_tok_s": vanilla_ref.get("vanilla_tgp_tok_s", ""),
-        "vanilla_n_generated": vanilla_ref.get("vanilla_n_generated", ""),
-        "spec_pp_ms": s.get("pp_ms", ""),
-        "spec_gen_ms": s.get("gen_ms", ""),
-        "spec_pp_tok_s": s.get("pp_tok_s", ""),
-        "spec_tgp_tok_s": s.get("tgp_tok_s", ""),
-        "spec_n_generated": s.get("n_generated", ""),
-        "tgp_speedup_vs_vanilla": speedup,
-        "accept_rate_pct": s.get("accept_rate_pct", ""),
-        "mean_accepted_per_step": s.get("mean_accepted_per_step", ""),
-        "n_propose_steps": s.get("n_propose_steps", ""),
-        "n_drafted": s.get("n_drafted", ""),
-        "n_accepted": s.get("n_accepted", ""),
-        "ms_draft_step": s.get("ms_per_step_draft", ""),
-        "ms_verify_step": s.get("ms_per_step_verify", ""),
-        "ms_logits_decode": s.get("ms_per_step_logits_decode", ""),
-        "ms_decode_submit": s.get("ms_per_step_decode_submit", ""),
-        "ms_accept": s.get("ms_per_step_accept", ""),
-        "ms_layer_commit": s.get("ms_per_step_layer_commit", ""),
-        "ms_feature_redecode": s.get("ms_per_step_feature_redecode", ""),
-        "ms_process": s.get("ms_per_step_process", ""),
-        "ms_propose_total": s.get("ms_per_propose_total", ""),
-        "tokens_per_propose": s.get("tokens_per_propose", ""),
-        "ms_per_token_effective": s.get("ms_per_token_effective", ""),
-        "ms_per_token_vanilla_fwd": s.get("ms_per_token_vanilla_fwd", ""),
-        "draft_ms_total": s.get("draft_ms_total", ""),
-        "verify_ms_total": s.get("verify_ms_total", ""),
-        "token_match": j.get("token_match", ""),
-        "first_mismatch_gen": j.get("first_mismatch_gen", ""),
-        "input_ids_path": str(input_ids),
-        "reference_path": str(reference),
-        "json_results_path": str(json_path),
-        "harness_exit_code": exit_code,
-    }
+    row = base_row(
+        commit,
+        prompt,
+        decode_mode=decode_mode,
+        spec_type=spec_type,
+        run_mode="spec",
+        n_predict=n_predict,
+        n_ctx=n_ctx,
+        n_max=n_max,
+        confidence=confidence,
+    )
+    row.update(
+        {
+            "n_prompt_tokens": j.get("n_prompt_tokens", prompt.get("prompt_tokens", "")),
+            "temp": j.get("temp", 0),
+            "seed": j.get("seed", 42),
+            "vanilla_pp_ms": vanilla_ref.get("vanilla_pp_ms", ""),
+            "vanilla_gen_ms": vanilla_ref.get("vanilla_gen_ms", ""),
+            "vanilla_pp_tok_s": vanilla_ref.get("vanilla_pp_tok_s", ""),
+            "vanilla_tgp_tok_s": vanilla_ref.get("vanilla_tgp_tok_s", ""),
+            "vanilla_n_generated": vanilla_ref.get("vanilla_n_generated", ""),
+            "spec_pp_ms": s.get("pp_ms", ""),
+            "spec_gen_ms": s.get("gen_ms", ""),
+            "spec_pp_tok_s": s.get("pp_tok_s", ""),
+            "spec_tgp_tok_s": s.get("tgp_tok_s", ""),
+            "spec_n_generated": s.get("n_generated", ""),
+            "tgp_speedup_vs_vanilla": speedup,
+            "accept_rate_pct": s.get("accept_rate_pct", ""),
+            "mean_accepted_per_step": s.get("mean_accepted_per_step", ""),
+            "n_propose_steps": s.get("n_propose_steps", ""),
+            "n_drafted": s.get("n_drafted", ""),
+            "n_accepted": s.get("n_accepted", ""),
+            "ms_draft_step": s.get("ms_per_step_draft", ""),
+            "ms_verify_step": s.get("ms_per_step_verify", ""),
+            "ms_logits_decode": s.get("ms_per_step_logits_decode", ""),
+            "ms_decode_submit": s.get("ms_per_step_decode_submit", ""),
+            "ms_accept": s.get("ms_per_step_accept", ""),
+            "ms_layer_commit": s.get("ms_per_step_layer_commit", ""),
+            "ms_feature_redecode": s.get("ms_per_step_feature_redecode", ""),
+            "ms_process": s.get("ms_per_step_process", ""),
+            "ms_propose_total": s.get("ms_per_propose_total", ""),
+            "tokens_per_propose": s.get("tokens_per_propose", ""),
+            "ms_per_token_effective": s.get("ms_per_token_effective", ""),
+            "ms_per_token_vanilla_fwd": s.get("ms_per_token_vanilla_fwd", ""),
+            "draft_ms_total": s.get("draft_ms_total", ""),
+            "verify_ms_total": s.get("verify_ms_total", ""),
+            "token_match": j.get("token_match", ""),
+            "first_mismatch_gen": j.get("first_mismatch_gen", ""),
+            "input_ids_path": str(input_ids),
+            "reference_path": str(reference),
+            "draft_model_path": draft_path,
+            "json_results_path": str(json_path),
+            "harness_exit_code": exit_code,
+        }
+    )
+    return row
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", default=os.environ.get("DSPARK_TARGET", "~/models/Qwen3-8B-Q4_K_M.gguf"))
     ap.add_argument("--draft", default=os.environ.get("DSPARK_DRAFT", "~/models/dspark_qwen3_8b_block7.q4_k_m.gguf"))
+    ap.add_argument("--mtp-draft", default=os.environ.get("DSPARK_MTP_DRAFT", ""), help="MTP head GGUF (auto-detect mtp-*.gguf)")
     ap.add_argument("--compare-bin", default="build/bin/compare_vanilla_speculative")
     ap.add_argument("--manifest", default="scripts/dspark-vps/eval/qwen3/manifest.json")
     ap.add_argument("--csv", default="scripts/dspark-vps/eval/qwen3/results.csv")
     ap.add_argument("--expected-dir", default="scripts/dspark-vps/eval/qwen3/expected")
     ap.add_argument("--json-dir", default="scripts/dspark-vps/eval/qwen3/runs")
+    ap.add_argument("-c", "--n-ctx", type=int, default=8096, help="context size (never use full trained ctx)")
     ap.add_argument("-n", "--n-predict", type=int, default=200)
     ap.add_argument("--n-max", type=int, default=4)
     ap.add_argument(
@@ -328,20 +411,22 @@ def main() -> int:
         type=float,
         nargs="*",
         default=[0.0, 0.3, 0.5, 0.7, 0.9],
-        help="confidence thresholds to sweep (spec phase)",
+        help="DSpark confidence thresholds",
     )
+    ap.add_argument("--modes", nargs="*", default=["vanilla", "mtp", "dspark"], help="vanilla mtp dspark")
     ap.add_argument("--categories", nargs="*", default=["code", "agentic"])
     ap.add_argument("--thinking", nargs="*", default=["off", "on"])
     ap.add_argument("--prompt-ids", nargs="*", help="subset of prompt ids")
-    ap.add_argument("--vanilla-only", action="store_true", help="only phase 1")
-    ap.add_argument("--spec-only", action="store_true", help="only phase 2 (needs expected)")
-    ap.add_argument("--no-cooldown", action="store_true", help="set DSPARK_BENCH_NO_COOLDOWN=1")
-    ap.add_argument("--quick", action="store_true", help="2 prompts per category, n=64, conf 0 only")
+    ap.add_argument("--vanilla-only", action="store_true")
+    ap.add_argument("--spec-only", action="store_true")
+    ap.add_argument("--no-cooldown", action="store_true")
+    ap.add_argument("--quick", action="store_true")
     args = ap.parse_args()
 
     root = repo_root()
     target = str(Path(args.target).expanduser())
-    draft = str(Path(args.draft).expanduser())
+    dspark_draft = str(Path(args.draft).expanduser())
+    mtp_draft = resolve_mtp_draft(target, args.mtp_draft or None)
     compare_bin = root / args.compare_bin
     manifest_path = root / args.manifest
     csv_path = root / args.csv
@@ -357,17 +442,31 @@ def main() -> int:
         print(f"error: missing manifest {manifest_path}; run scripts/gen_qwen3_eval_fixtures.py", file=sys.stderr)
         return 1
 
+    modes = set(args.modes)
+    if args.vanilla_only:
+        modes = {"vanilla"}
+    if args.spec_only:
+        modes.discard("vanilla")
+
     prompts = load_manifest(manifest_path)
     prompts = [p for p in prompts if p["category"] in args.categories]
     prompts = [p for p in prompts if p["thinking"] in args.thinking]
     if args.prompt_ids:
-        ids = set(args.prompt_ids)
-        prompts = [p for p in prompts if p["id"] in ids]
+        wanted = set(args.prompt_ids)
+        prompts = [p for p in prompts if p["id"] in wanted]
 
     if args.quick:
         prompts = [p for p in prompts if p["id"].endswith("01") or p["id"].endswith("02")]
         args.n_predict = 64
         args.confidence = [0.0]
+
+    if "mtp" in modes and mtp_draft is None:
+        print(
+            "note: MTP not available for this target (Qwen3-8B has no inbuilt MTP; "
+            "need Qwen3.5+ with mtp-*.gguf). Skipping mtp mode.",
+            file=sys.stderr,
+        )
+        modes.discard("mtp")
 
     commit = git_commit(root)
     env = os.environ.copy()
@@ -377,8 +476,7 @@ def main() -> int:
 
     vanilla_cache: dict[str, dict] = {}
 
-    # Phase 1: vanilla-only (target model only, one process at a time)
-    if not args.spec_only:
+    if "vanilla" in modes:
         for p in prompts:
             input_ids = root / "scripts/dspark-vps/eval/qwen3" / p["input_ids"]
             ref_path = expected_dir / f"{p['id']}_think_{p['thinking']}.json"
@@ -394,8 +492,10 @@ def main() -> int:
                 vanilla_only=True,
                 spec_only=False,
                 n_predict=args.n_predict,
+                n_ctx=args.n_ctx,
                 n_max=args.n_max,
                 confidence=0.0,
+                spec_type="none",
                 env=env,
                 extra_args=[],
             )
@@ -403,7 +503,7 @@ def main() -> int:
                 print(f"warning: no json results for vanilla {p['id']}", file=sys.stderr)
                 continue
             row = vanilla_row_from_json(
-                commit, p, args.n_predict, 0.0, args.n_max, j,
+                commit, p, args.n_predict, args.n_ctx, args.n_max, j,
                 input_ids=input_ids, reference=ref_path, json_path=json_path, exit_code=code,
             )
             vanilla_cache[f"{p['id']}_think_{p['thinking']}"] = row
@@ -412,34 +512,41 @@ def main() -> int:
             if code != 0:
                 return code
 
-    # Phase 2: spec-only sweeps (loads target + draft; one harness invocation at a time)
-    if not args.vanilla_only:
+    def load_vanilla_row(p: dict, input_ids: Path, ref_path: Path) -> dict:
+        key = f"{p['id']}_think_{p['thinking']}"
+        if key in vanilla_cache:
+            return vanilla_cache[key]
+        vpath = json_dir / f"vanilla_{p['id']}_think_{p['thinking']}.json"
+        if vpath.exists():
+            vj = load_json(vpath)
+            return vanilla_row_from_json(
+                commit, p, args.n_predict, args.n_ctx, args.n_max, vj,
+                input_ids=input_ids, reference=ref_path, json_path=vpath, exit_code=0,
+            )
+        return {}
+
+    spec_modes: list[tuple[str, str, str, list[float]]] = []
+    if "mtp" in modes and mtp_draft:
+        spec_modes.append(("mtp", "draft-mtp", mtp_draft, [0.0]))
+    if "dspark" in modes:
+        spec_modes.append(("dspark", "draft-dspark", dspark_draft, list(args.confidence)))
+
+    for decode_mode, spec_type, draft_path, confs in spec_modes:
         for p in prompts:
-            key = f"{p['id']}_think_{p['thinking']}"
             input_ids = root / "scripts/dspark-vps/eval/qwen3" / p["input_ids"]
             ref_path = expected_dir / f"{p['id']}_think_{p['thinking']}.json"
             if not ref_path.exists():
                 print(f"warning: missing reference {ref_path}, skip", file=sys.stderr)
                 continue
+            van_row = load_vanilla_row(p, input_ids, ref_path)
 
-            van_row = vanilla_cache.get(key)
-            if van_row is None and (json_dir / f"vanilla_{p['id']}_think_{p['thinking']}.json").exists():
-                vj = load_json(json_dir / f"vanilla_{p['id']}_think_{p['thinking']}.json")
-                van_row = vanilla_row_from_json(
-                    commit, p, args.n_predict, 0.0, args.n_max, vj,
-                    input_ids=input_ids, reference=ref_path,
-                    json_path=json_dir / f"vanilla_{p['id']}_think_{p['thinking']}.json",
-                    exit_code=0,
-                )
-            if van_row is None:
-                van_row = {}
-
-            for conf in args.confidence:
-                json_path = json_dir / f"spec_{p['id']}_think_{p['thinking']}_c{conf}_n{args.n_max}.json"
+            for conf in confs:
+                tag = f"{decode_mode}_{p['id']}_think_{p['thinking']}_c{conf}_n{args.n_max}"
+                json_path = json_dir / f"{tag}.json"
                 code, j = run_harness(
                     compare_bin,
                     target=target,
-                    draft=draft,
+                    draft=draft_path,
                     input_ids=input_ids,
                     reference=ref_path,
                     save_output=None,
@@ -447,27 +554,31 @@ def main() -> int:
                     vanilla_only=False,
                     spec_only=True,
                     n_predict=args.n_predict,
+                    n_ctx=args.n_ctx,
                     n_max=args.n_max,
                     confidence=conf,
+                    spec_type=spec_type,
                     env=env,
                     extra_args=[],
                 )
                 if j is None:
-                    print(f"warning: no json results for spec {p['id']} conf={conf}", file=sys.stderr)
+                    print(f"warning: no json for {tag}", file=sys.stderr)
                     continue
                 row = spec_row_from_json(
-                    commit, p, args.n_predict, conf, args.n_max, j, van_row,
-                    input_ids=input_ids, reference=ref_path, json_path=json_path, exit_code=code,
+                    commit, p, decode_mode, spec_type, args.n_predict, args.n_ctx,
+                    conf, args.n_max, j, van_row,
+                    input_ids=input_ids, reference=ref_path, draft_path=draft_path,
+                    json_path=json_path, exit_code=code,
                 )
                 append_csv_row(csv_path, row)
                 print(
-                    f"spec {p['id']} thinking={p['thinking']} conf={conf} "
+                    f"{decode_mode} {p['id']} thinking={p['thinking']} conf={conf} "
                     f"match={row.get('token_match')} speedup={row.get('tgp_speedup_vs_vanilla')}",
                     flush=True,
                 )
                 if code != 0:
                     return code
-                time.sleep(1)  # brief pause between spec runs
+                time.sleep(1)
 
     print(f"results appended to {csv_path}", flush=True)
     return 0

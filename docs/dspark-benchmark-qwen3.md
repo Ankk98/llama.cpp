@@ -106,16 +106,27 @@ Keep threshold `0` for throughput on Vulkan Q4.
 # Generate 20 prompts x thinking on/off token fixtures
 python3 scripts/gen_qwen3_eval_fixtures.py
 
-# Full benchmark suite (vanilla refs + spec confidence sweep -> streaming CSV)
+# Full benchmark: vanilla | MTP (if model has mtp-*.gguf) | DSpark
+# Default -c 8096 (never full trained ctx; Qwen3-8B trained ctx is 40960)
 python3 scripts/dspark-bench-qwen3.py --no-cooldown
 
 # Quick smoke (2 prompts/category, n=64)
-python3 scripts/dspark-bench-qwen3.py --quick --no-cooldown
+python3 scripts/dspark-bench-qwen3.py --quick --no-cooldown --modes vanilla dspark
 ```
+
+### Decode modes
+
+| Mode | Description |
+|------|-------------|
+| `vanilla` | Target only |
+| `mtp` | Target + inbuilt MTP head (`--spec-type draft-mtp`, needs `mtp-*.gguf`) |
+| `dspark` | Target + external DSpark draft |
+
+**Qwen3-8B:** no inbuilt MTP (`nextn_predict_layers=0`). MTP mode is skipped automatically.
+MTP applies to **Qwen3.5+** (and Gemma4, Step35, etc.) with a separate `mtp-*.gguf` head.
 
 Results append to `scripts/dspark-vps/eval/qwen3/results.csv` (flushed per row).
 Vanilla expected outputs: `scripts/dspark-vps/eval/qwen3/expected/`.
-Per-run JSON: `scripts/dspark-vps/eval/qwen3/runs/`.
 
 ```bash
 TARGET=~/models/Qwen3-8B-Q4_K_M.gguf
