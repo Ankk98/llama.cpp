@@ -155,53 +155,47 @@ bool dspark_pipeline_step(dspark_pipeline_state * st, dspark_step_result * out) 
 
     const double tv0 = dspark_now_ms();
 
-    if (getenv("DSPARK_VANILLA_VERIFY")) {
+    // ---- DSpark parallel verify (single forward on canonical seq) ----
+    //
+    // Decode [anchor, draft_0, draft_1, ...] in one llama_decode on seq_main.
+    // Greedy-accept the longest prefix whose row argmax matches the draft.
+    // Trim the rejected tail after accept. Target layer features are extracted
+    // during this same forward; process() injects them into the draft.
+    //
+    // This is the DFlash / vLLM pattern: one forward per propose step delivers
+    // logits + KV + features. Correctness depends on the model-graph fix
+    // (qwen3.cpp / gemma4.cpp) that makes batched multi-token logits
+    // numerically identical to single-token decode on this backend.
+
+    if ((int) propose.draft.size() >= st->cfg.min_verify_tokens) {
+        common_speculative_dspark_target_features_enable(st->spec, true);
+
         common_batch_clear(st->batch_tgt);
         common_batch_add(st->batch_tgt, st->anchor, pos_verify, { st->mem.seq_main }, true);
-        llama_decode(st->mem.ctx_tgt, st->batch_tgt);
-        const llama_token next = common_sampler_sample(st->smpl, st->mem.ctx_tgt, -1, false);
-        common_sampler_accept(st->smpl, next, true);
-        accepted.assign(1, next);
-    } else if (getenv("DSPARK_VERIFY_SEQ") != nullptr
-            && (int) propose.draft.size() >= st->cfg.min_verify_tokens) {
-        if (!dspark_target_verify_sequential(
-                    st->spec, st->smpl, &st->mem,
-                    pos_verify, st->anchor, propose.draft,
-                    accepted, st->batch_tgt)) {
-            return false;
+        for (size_t i = 0; i < propose.draft.size(); ++i) {
+            common_batch_add(st->batch_tgt, propose.draft[i],
+                    pos_verify + 1 + (llama_pos) i, { st->mem.seq_main }, true);
         }
-    } else if ((int) propose.draft.size() >= st->cfg.min_verify_tokens) {
-        dspark_verify_timing vtim {};
-
-        if (!dspark_target_verify_logits(
-                    &st->mem, st->spec, pos_verify, st->anchor, propose.draft,
-                    st->batch_tgt, &vtim)) {
+        if (llama_decode(st->mem.ctx_tgt, st->batch_tgt) != 0) {
             return false;
         }
 
-        accepted = dspark_target_accept_chain(
-                st->smpl, st->mem.ctx_tgt, propose.draft, nullptr, st->cfg.temp);
-
-        dspark_target_verify_scratch_cleanup(&st->mem, pos_verify);
-
+        accepted = common_sampler_sample_and_accept_n(st->smpl, st->mem.ctx_tgt, propose.draft);
         if (accepted.empty()) {
             return false;
         }
 
-        if (!dspark_target_commit_tokens(
-                    st->spec, &st->mem, pos_verify, st->anchor, accepted,
-                    st->batch_tgt, &vtim)) {
+        // trim rejected draft tail from target KV
+        llama_memory_seq_rm(llama_get_memory(st->mem.ctx_tgt), st->mem.seq_main,
+                pos_verify + (llama_pos) accepted.size(), -1);
+
+        // inject target features into draft (only the accepted positions matter;
+        // rejected draft features are harmless since draft KV is trimmed below)
+        if (!common_speculative_process(st->spec, st->batch_tgt)) {
             return false;
         }
-
-        if (!dspark_draft_process_committed(
-                    st->spec, &st->mem, pos_verify, st->anchor, accepted,
-                    st->batch_tgt)) {
-            return false;
-        }
-
-        out->timing.verify_detail = vtim;
     } else {
+        // draft too short: single-token fallback
         if (!dspark_target_commit_one_greedy(
                     st->spec, &st->mem, st->smpl,
                     pos_verify, st->anchor, st->batch_tgt, accepted)) {
