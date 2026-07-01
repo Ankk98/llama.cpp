@@ -83,6 +83,11 @@ bool dspark_pipeline_prefill(
 
 bool dspark_pipeline_step(dspark_pipeline_state * st, dspark_step_result * out);
 
+// Alias for server/bench integration (see dspark-refactor-pipeline.md).
+static inline bool dspark_pipeline_generate_step(dspark_pipeline_state * st, dspark_step_result * out) {
+    return dspark_pipeline_step(st, out);
+}
+
 bool dspark_pipeline_run(
         common_params & params,
         common_speculative * spec,

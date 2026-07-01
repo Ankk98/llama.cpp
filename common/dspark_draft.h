@@ -24,3 +24,12 @@ bool dspark_draft_propose(
 
 // Trim target/draft KV beyond committed n_past.
 void dspark_memory_trim_beyond(dspark_memory_bundle * mem, llama_pos n_past);
+
+// Phase D: inject target layer features into draft KV for committed tokens.
+bool dspark_draft_process_committed(
+        common_speculative * spec,
+        dspark_memory_bundle * mem,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed,
+        llama_batch & batch);

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "dspark_target.h"
+#include "dspark_draft.h"
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -3383,17 +3384,26 @@ bool common_speculative_dspark_process_committed(
         return true;
     }
 
+    dspark_memory_bundle mem;
+    dspark_memory_bundle_init(&mem, ctx_tgt, nullptr, nullptr, seq_id);
+    for (auto & impl : spec->impls) {
+        if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
+            mem.ctx_tgt_feat = f;
+        }
+    }
+
     if (!kv_append_only) {
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
     }
 
-    dspark_memory_bundle mem;
-    mem.ctx_tgt  = ctx_tgt;
-    mem.seq_main = seq_id;
-
     dspark_verify_timing timing {};
-    return dspark_target_commit_tokens(
-            spec, &mem, pos_verify, anchor, committed_ids, batch, &timing);
+    if (!dspark_target_commit_tokens(
+            spec, &mem, pos_verify, anchor, committed_ids, batch, &timing)) {
+        return false;
+    }
+
+    return dspark_draft_process_committed(
+            spec, &mem, pos_verify, anchor, committed_ids, batch);
 }
 
 static bool dspark_ctx_save_state(llama_context * ctx, std::vector<uint8_t> & buf) {
@@ -3545,8 +3555,7 @@ bool common_speculative_dspark_verify_batched(
     }
 
     dspark_memory_bundle mem;
-    mem.ctx_tgt  = ctx_tgt;
-    mem.seq_main = seq_id;
+    dspark_memory_bundle_init(&mem, ctx_tgt, nullptr, nullptr, seq_id);
     for (auto & impl : spec->impls) {
         if (llama_context * f = impl->dspark_ctx_tgt_feat()) {
             mem.ctx_tgt_feat = f;
@@ -3619,8 +3628,7 @@ bool common_speculative_dspark_verify_sequential(
         llama_tokens & out_ids,
         llama_batch & batch) {
     dspark_memory_bundle mem;
-    mem.ctx_tgt  = ctx_tgt;
-    mem.seq_main = seq_id;
+    dspark_memory_bundle_init(&mem, ctx_tgt, nullptr, nullptr, seq_id);
 
     return dspark_target_verify_sequential(
             spec, smpl, &mem, pos_verify, anchor, draft, out_ids, batch);

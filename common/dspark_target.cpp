@@ -1,5 +1,6 @@
 #include "dspark_target.h"
 
+#include "dspark_draft.h"
 #include "speculative.h"
 
 #include "../src/llama-ext.h"
@@ -46,11 +47,34 @@ static bool dspark_state_save(llama_context * ctx, std::vector<uint8_t> & buf) {
     return llama_state_get_data(ctx, buf.data(), sz) == sz;
 }
 
-static bool dspark_state_restore(llama_context * ctx, const std::vector<uint8_t> & buf) {
-    if (buf.empty()) {
-        return false;
+static void dspark_target_assert_canonical_unchanged(
+        llama_context * ctx_tgt,
+        llama_seq_id seq_main,
+        llama_pos kv_max_before,
+        const char * tag) {
+    if (!getenv("DSPARK_KV_ASSERT")) {
+        return;
     }
-    return llama_state_set_data(ctx, buf.data(), buf.size()) == buf.size();
+
+    llama_memory_t mem = llama_get_memory(ctx_tgt);
+    const llama_pos kv_max_after = llama_memory_seq_pos_max(mem, seq_main);
+    if (kv_max_after != kv_max_before) {
+        fprintf(stderr,
+                "DSPARK_KV_ASSERT: %s canonical KV changed across verify kv_max %d -> %d\n",
+                tag, (int) kv_max_before, (int) kv_max_after);
+        GGML_ABORT("DSpark verify touched canonical KV");
+    }
+}
+
+static void dspark_assert_batch_scratch_only(const llama_batch & batch, llama_seq_id seq_scratch) {
+    if (!getenv("DSPARK_KV_ASSERT")) {
+        return;
+    }
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        GGML_ASSERT(batch.n_seq_id[i] == 1);
+        GGML_ASSERT(batch.seq_id[i][0] == seq_scratch);
+    }
 }
 
 // Debug-only: compare batched row logits vs one-token chain on scratch seq.
@@ -94,6 +118,23 @@ llama_seq_id dspark_target_scratch_seq_id(const llama_context * ctx, llama_seq_i
         return scratch;
     }
     return seq_main;
+}
+
+void dspark_memory_bundle_init(
+        dspark_memory_bundle * mem,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_context * ctx_tgt_feat,
+        llama_seq_id seq_main) {
+    if (mem == nullptr) {
+        return;
+    }
+
+    mem->ctx_tgt      = ctx_tgt;
+    mem->ctx_dft      = ctx_dft;
+    mem->ctx_tgt_feat = ctx_tgt_feat;
+    mem->seq_main     = seq_main;
+    mem->seq_scratch  = dspark_target_scratch_seq_id(ctx_tgt, seq_main);
 }
 
 void dspark_target_assert_canonical_kv(
@@ -184,9 +225,10 @@ bool dspark_target_verify_logits(
             && getenv("DSPARK_VERIFY_DEFER_SCRATCH") != nullptr
             && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
 
-    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
-
     dspark_target_assert_canonical_kv(ctx_tgt, seq_main, pos_verify, "pre-verify");
+
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+    const llama_pos kv_max_before = llama_memory_seq_pos_max(mem_tgt, seq_main);
 
     dspark_verify_prepare_scratch(ctx_tgt, mem_tgt, seq_main, seq_scratch);
 
@@ -207,6 +249,8 @@ bool dspark_target_verify_logits(
                 "DSPARK_TRACE_VERIFY: batch[0] anchor=%d pos=%d pos_verify=%d draft_n=%zu\n",
                 (int) anchor, (int) pos_verify, (int) pos_verify, draft.size());
     }
+
+    dspark_assert_batch_scratch_only(batch, seq_scratch);
 
     const int64_t t0 = timing ? ggml_time_us() : 0;
 
@@ -283,6 +327,8 @@ bool dspark_target_verify_logits(
     if (!layer_taps) {
         common_speculative_dspark_target_features_enable(spec, false);
     }
+
+    dspark_target_assert_canonical_unchanged(ctx_tgt, seq_main, kv_max_before, "post-verify");
 
     return true;
 }
@@ -378,10 +424,6 @@ bool dspark_target_commit_tokens(
         if (llama_decode(mem->ctx_tgt, batch) != 0) {
             return false;
         }
-
-        if (!common_speculative_process(spec, batch)) {
-            return false;
-        }
     }
 
     if (timing) {
@@ -422,10 +464,6 @@ bool dspark_target_commit_one_greedy(
     const llama_token id = common_sampler_sample(smpl, mem->ctx_tgt, -1, false);
     common_sampler_accept(smpl, id, true);
     out_one.push_back(id);
-
-    if (!common_speculative_process(spec, batch)) {
-        return false;
-    }
 
     return true;
 }
@@ -518,17 +556,14 @@ bool dspark_target_verify_step(
     }
 
     if (draft.empty()) {
-        return dspark_target_commit_one_greedy(
-                spec, mem, smpl, pos_verify, anchor, batch, out_ids);
+        if (!dspark_target_commit_one_greedy(
+                spec, mem, smpl, pos_verify, anchor, batch, out_ids)) {
+            return false;
+        }
+        return dspark_draft_process_committed(spec, mem, pos_verify, anchor, out_ids, batch);
     }
 
     const int64_t t_accept0 = timing ? ggml_time_us() : 0;
-
-    std::vector<uint8_t> pre_snap;
-    const bool use_pre_snap = getenv("DSPARK_NO_VERIFY_PRE_SNAP") == nullptr;
-    if (use_pre_snap) {
-        dspark_state_save(mem->ctx_tgt, pre_snap);
-    }
 
     if (!dspark_target_verify_logits(mem, spec, pos_verify, anchor, draft, batch, timing)) {
         return false;
@@ -543,16 +578,12 @@ bool dspark_target_verify_step(
     dspark_target_verify_scratch_cleanup(mem, pos_verify);
 
     if (out_ids.empty()) {
-        if (use_pre_snap && !pre_snap.empty()) {
-            dspark_state_restore(mem->ctx_tgt, pre_snap);
-        }
         return false;
     }
 
-    if (use_pre_snap && !pre_snap.empty()) {
-        dspark_state_restore(mem->ctx_tgt, pre_snap);
+    if (!dspark_target_commit_tokens(spec, mem, pos_verify, anchor, out_ids, batch, timing)) {
+        return false;
     }
 
-    return dspark_target_commit_tokens(
-            spec, mem, pos_verify, anchor, out_ids, batch, timing);
+    return dspark_draft_process_committed(spec, mem, pos_verify, anchor, out_ids, batch);
 }

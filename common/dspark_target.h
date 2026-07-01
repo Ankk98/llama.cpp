@@ -30,6 +30,13 @@ struct dspark_verify_timing {
 // Scratch seq for batched verify logits (seq_main + 1 when n_seq_max allows).
 llama_seq_id dspark_target_scratch_seq_id(const llama_context * ctx, llama_seq_id seq_main);
 
+void dspark_memory_bundle_init(
+        dspark_memory_bundle * mem,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_context * ctx_tgt_feat,
+        llama_seq_id seq_main);
+
 void dspark_target_assert_canonical_kv(
         llama_context * ctx_tgt,
         llama_seq_id seq_main,
@@ -61,7 +68,7 @@ void dspark_target_verify_scratch_cleanup(
         dspark_memory_bundle * mem,
         llama_pos pos_verify);
 
-// Phase C: append accepted tokens on canonical seq + draft feature inject.
+// Phase C: append accepted tokens on canonical seq (decode only; no draft inject).
 bool dspark_target_commit_tokens(
         common_speculative * spec,
         dspark_memory_bundle * mem,
@@ -71,7 +78,7 @@ bool dspark_target_commit_tokens(
         llama_batch & batch,
         dspark_verify_timing * timing = nullptr);
 
-// Single-token fallback when draft block is empty (canonical decode + process).
+// Single-token fallback: decode anchor on canonical seq + sample (no process).
 bool dspark_target_commit_one_greedy(
         common_speculative * spec,
         dspark_memory_bundle * mem,

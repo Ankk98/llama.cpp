@@ -29,8 +29,7 @@ bool dspark_pipeline_init(
     st->mem.ctx_tgt      = ctx_tgt;
     st->mem.ctx_dft      = ctx_dft;
     st->mem.ctx_tgt_feat = ctx_tgt_feat;
-    st->mem.seq_main     = 0;
-    st->mem.seq_scratch  = dspark_target_scratch_seq_id(ctx_tgt, 0);
+    dspark_memory_bundle_init(&st->mem, ctx_tgt, ctx_dft, ctx_tgt_feat, 0);
 
     st->spec        = spec;
     st->smpl        = smpl;
@@ -169,20 +168,55 @@ bool dspark_pipeline_step(dspark_pipeline_state * st, dspark_step_result * out) 
         const llama_token next = common_sampler_sample(st->smpl, st->mem.ctx_tgt, -1, false);
         common_sampler_accept(st->smpl, next, true);
         accepted.assign(1, next);
-    } else if ((int) propose.draft.size() >= st->cfg.min_verify_tokens) {
-        dspark_verify_timing vtim {};
-        if (!dspark_target_verify_step(
+    } else if (getenv("DSPARK_VERIFY_SEQ") != nullptr
+            && (int) propose.draft.size() >= st->cfg.min_verify_tokens) {
+        if (!dspark_target_verify_sequential(
                     st->spec, st->smpl, &st->mem,
                     pos_verify, st->anchor, propose.draft,
-                    accepted, st->batch_tgt, &vtim,
-                    nullptr, st->cfg.temp)) {
+                    accepted, st->batch_tgt)) {
             return false;
         }
+    } else if ((int) propose.draft.size() >= st->cfg.min_verify_tokens) {
+        dspark_verify_timing vtim {};
+
+        if (!dspark_target_verify_logits(
+                    &st->mem, st->spec, pos_verify, st->anchor, propose.draft,
+                    st->batch_tgt, &vtim)) {
+            return false;
+        }
+
+        accepted = dspark_target_accept_chain(
+                st->smpl, st->mem.ctx_tgt, propose.draft, nullptr, st->cfg.temp);
+
+        dspark_target_verify_scratch_cleanup(&st->mem, pos_verify);
+
+        if (accepted.empty()) {
+            return false;
+        }
+
+        if (!dspark_target_commit_tokens(
+                    st->spec, &st->mem, pos_verify, st->anchor, accepted,
+                    st->batch_tgt, &vtim)) {
+            return false;
+        }
+
+        if (!dspark_draft_process_committed(
+                    st->spec, &st->mem, pos_verify, st->anchor, accepted,
+                    st->batch_tgt)) {
+            return false;
+        }
+
         out->timing.verify_detail = vtim;
     } else {
         if (!dspark_target_commit_one_greedy(
                     st->spec, &st->mem, st->smpl,
                     pos_verify, st->anchor, st->batch_tgt, accepted)) {
+            return false;
+        }
+
+        if (!dspark_draft_process_committed(
+                    st->spec, &st->mem, pos_verify, st->anchor, accepted,
+                    st->batch_tgt)) {
             return false;
         }
     }

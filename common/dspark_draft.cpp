@@ -46,3 +46,28 @@ void dspark_memory_trim_beyond(dspark_memory_bundle * mem, llama_pos n_past) {
         llama_memory_seq_rm(llama_get_memory(mem->ctx_dft), 0, n_past, -1);
     }
 }
+
+bool dspark_draft_process_committed(
+        common_speculative * spec,
+        dspark_memory_bundle * mem,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & committed,
+        llama_batch & batch) {
+    if (spec == nullptr || mem == nullptr || committed.empty()) {
+        return true;
+    }
+
+    for (size_t i = 0; i < committed.size(); ++i) {
+        const llama_token tok_in = (i == 0) ? anchor : committed[i - 1];
+
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_in, pos_verify + (llama_pos) i, { mem->seq_main }, false);
+
+        if (!common_speculative_process(spec, batch)) {
+            return false;
+        }
+    }
+
+    return true;
+}
