@@ -286,3 +286,24 @@ all the scratch/snapshot/sequential machinery as the user requested.
   n=250 and code01_think_off n=200: expect token_match=True.
 - Measure tgp speedup: batched verify should give ~2x once working.
 - Then do the DSpark structural refactor (remove scratch/seq, simplify).
+
+## Vulkan mul_mat_vec investigation
+
+The mul_mat_vec shader (`mul_mat_vec_base.glsl`) uses a compile-time
+specialization constant `NUM_COLS` (constant_id=2). Different `ne11` values
+get different compiled SPIR-V with different `[[unroll]]` patterns, causing
+different FP accumulation order. Fix: `DSPARK_CONSISTENT_MMV=1` forces all
+`ne11` to use `NUM_COLS=8` (max batch width), making per-column mul_mat
+results numerically identical.
+
+Result: smoke scan passes (batched row0 == sequential row0 through 90 steps)
+with CONSISTENT_MMV on. But MAINSEQ parallel verify still diverges because
+the full batched forward's KV still differs from single-token KV — other ops
+(attention softmax, elementwise, etc.) also have n_tokens-dependent numerics
+not yet addressed.
+
+**3 commits**: graph fix (qwen3/gemma4 gather removal), pipeline cleanup
+(timing fix + batched re-decode), consistent MMV flag.
+**Status**: MAINSEQ path 1.57x on code_500l (match True), diverges on
+lower-accept prompts. Root cause is Vulkan backend n_tokens-dependent
+numerics across the FULL forward pass, not just lm_head or mul_mat_vec.
