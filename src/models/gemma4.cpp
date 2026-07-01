@@ -413,9 +413,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
+    // DSpark/spec-decoding note: do NOT gather via inp_out_ids before lm_head on
+    // the logits path. The get_rows -> lm_head mul_mat combination diverges
+    // numerically on Vulkan between n_outputs=1 (single-token decode) and
+    // n_outputs=N (batched verify), flipping greedy argmax and breaking
+    // speculative decoding at temp=0. Computing lm_head on the full
+    // [n_embd, n_tokens] tensor keeps batched verify identical to decode.
+    // The embeddings_nextn_masked (MTP) path still gathers as before.
+    // if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    //     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    // }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

@@ -66,7 +66,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // NOTE: the inp_out_ids gather that the upstream qwen3 graph performs on the
+    // last layer is intentionally omitted here. See the comment at the FFN below.
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -111,10 +112,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-        }
+        // Do not gather the last-layer output via inp_out_ids before the FFN.
+        // The gather feeds the downstream norm + lm_head a [n_embd, n_outputs]
+        // tensor; on Vulkan this mul_mat dispatch diverges numerically between
+        // n_outputs=1 (single-token decode) and n_outputs=N (batched verify),
+        // which flips greedy argmax and breaks speculative decoding at temp=0.
+        // Computing the final FFN + norm + lm_head on the full [n_embd, n_tokens]
+        // tensor keeps the path identical to every other layer and makes batched
+        // verify bit-for-bit consistent with single-token decode.
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 

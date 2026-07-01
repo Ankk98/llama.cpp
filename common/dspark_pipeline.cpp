@@ -9,8 +9,8 @@
 
 static double dspark_now_ms() {
     using clock = std::chrono::steady_clock;
-    static const auto t0 = clock::now();
-    return 1e-3 * std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    return std::chrono::duration<double, std::milli>(
+            clock::now().time_since_epoch()).count();
 }
 
 bool dspark_pipeline_init(
@@ -123,12 +123,6 @@ bool dspark_pipeline_prefill(
     st->anchor = *out_first_gen;
 
     llama_batch_free(prefill);
-
-    const bool fused_verify = getenv("DSPARK_FUSED_ARGMAX") != nullptr
-            && getenv("DSPARK_GPU_GREEDY") == nullptr;
-    if (fused_verify) {
-        llama_set_skip_host_logits(ctx_tgt, true);
-    }
 
     return true;
 }
@@ -294,12 +288,6 @@ bool dspark_pipeline_run(
         st.spec_params = params.speculative;
         st.spec_params.dspark_temp = params.sampling.temp;
         st.spec_params.dspark_seed = params.sampling.seed;
-
-        if (getenv("DSPARK_TRACE_VERIFY")) {
-            char gen_buf[32];
-            snprintf(gen_buf, sizeof(gen_buf), "%d", out->n_generated);
-            setenv("DSPARK_TRACE_VERIFY_GEN", gen_buf, 1);
-        }
 
         dspark_step_result step {};
         if (!dspark_pipeline_step(&st, &step)) {

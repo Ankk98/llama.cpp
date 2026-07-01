@@ -558,6 +558,10 @@ int main(int argc, char ** argv) {
             const bool row0_match = compare_row0_logits(
                     ctx_tgt, spec, batch, state, 0, snap, false);
 
+            // compare_row0_logits leaves KV polluted (decoded at pos_verify+..);
+            // restore canonical snapshot before sequential verify consumes it.
+            restore_state(ctx_tgt, state);
+
             if (!row0_match && first_mismatch_step < 0) {
                 first_mismatch_step = step;
                 fprintf(stderr, "*** first row0 mismatch at step %d gen_index %d ***\n",
