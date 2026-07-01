@@ -7,6 +7,68 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
+#include <vector>
+
+static bool dspark_verify_canary_enabled() {
+    return getenv("DSPARK_VERIFY_CANARY") != nullptr;
+}
+
+static bool dspark_verify_layer_taps_enabled() {
+    return getenv("DSPARK_VERIFY_LAYER_TAPS") != nullptr;
+}
+
+static llama_token dspark_greedy_argmax_row(llama_context * ctx, int row) {
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * logits = llama_get_logits_ith_no_sync(ctx, row);
+    if (!logits) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return common_sampler_greedy_argmax(logits, n_vocab);
+}
+
+static void dspark_verify_prepare_main(
+        llama_context * ctx_tgt,
+        llama_memory_t mem_tgt,
+        llama_seq_id seq_main,
+        llama_pos pos_verify) {
+    llama_synchronize(ctx_tgt);
+    llama_memory_seq_rm(mem_tgt, seq_main, pos_verify, -1);
+}
+
+// Debug-only: compare batched row logits vs one-token chain on canonical seq.
+static int dspark_find_first_logit_mismatch(
+        llama_context * ctx_tgt,
+        llama_memory_t mem_tgt,
+        llama_seq_id seq_main,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_batch & batch,
+        const std::vector<llama_token> & batched_toks) {
+    const int n_rows = (int) draft.size() + 1;
+
+    for (int row = 0; row < n_rows; ++row) {
+        dspark_verify_prepare_main(ctx_tgt, mem_tgt, seq_main, pos_verify);
+
+        for (int j = 0; j <= row; ++j) {
+            const llama_token tok_in = (j == 0) ? anchor : draft[(size_t) j - 1];
+            common_batch_clear(batch);
+            common_batch_add(batch, tok_in, pos_verify + (llama_pos) j, { seq_main }, true);
+            if (llama_decode(ctx_tgt, batch) != 0) {
+                return row;
+            }
+            llama_synchronize(ctx_tgt);
+        }
+
+        const llama_token seq_tok = dspark_greedy_argmax_row(ctx_tgt, 0);
+        if (seq_tok != batched_toks[(size_t) row]) {
+            return row;
+        }
+    }
+
+    return -1;
+}
 
 llama_seq_id dspark_target_scratch_seq_id(const llama_context * ctx, llama_seq_id seq_main) {
     const llama_seq_id scratch = seq_main + 1;
@@ -91,44 +153,45 @@ bool dspark_target_verify_logits(
     }
 
     llama_context * ctx_tgt = mem->ctx_tgt;
-    const llama_seq_id seq_main    = mem->seq_main;
-    const llama_seq_id scratch_seq = mem->seq_scratch;
+    const llama_seq_id seq_main = mem->seq_main;
 
-    llama_context * ctx_feat = mem->ctx_tgt_feat;
-    (void) ctx_feat;
-
-    const bool split_verify = ctx_feat != nullptr && getenv("DSPARK_NO_SPLIT_VERIFY") == nullptr;
-
-    const bool force_committed = getenv("DSPARK_VERIFY_DEFER") == nullptr
-            || getenv("DSPARK_FORCE_VERIFY_COMMITTED") != nullptr
-            || getenv("DSPARK_VERIFY_LOGITS_ONLY") != nullptr;
-
-    const bool defer_layers = !split_verify && !force_committed
-            && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr
-            && getenv("DSPARK_VERIFY_DEFER_SCRATCH") != nullptr;
+    const bool layer_taps = dspark_verify_layer_taps_enabled();
+    const bool defer_layers = layer_taps
+            && getenv("DSPARK_VERIFY_DEFER_SCRATCH") != nullptr
+            && getenv("DSPARK_NO_DEFER_LAYER_INP") == nullptr;
 
     llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
 
     dspark_target_assert_canonical_kv(ctx_tgt, seq_main, pos_verify, "pre-verify");
 
-    llama_synchronize(ctx_tgt);
-    llama_memory_seq_rm(mem_tgt, scratch_seq, 0, -1);
-    llama_memory_seq_cp(mem_tgt, seq_main, scratch_seq, -1, -1);
-    llama_memory_seq_rm(mem_tgt, scratch_seq, pos_verify, -1);
+    dspark_verify_prepare_main(ctx_tgt, mem_tgt, seq_main, pos_verify);
 
     common_batch_clear(batch);
-    common_batch_add(batch, anchor, pos_verify, { scratch_seq }, true);
+    common_batch_add(batch, anchor, pos_verify, { seq_main }, true);
     for (size_t i = 0; i < draft.size(); ++i) {
-        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { scratch_seq }, true);
+        const llama_pos pos = pos_verify + 1 + (llama_pos) i;
+        common_batch_add(batch, draft[i], pos, { seq_main }, true);
+        if (getenv("DSPARK_TRACE_VERIFY")) {
+            fprintf(stderr,
+                    "DSPARK_TRACE_VERIFY: batch[%zu] tok=%d pos=%d (expect pos_verify+1+%zu=%d)\n",
+                    i + 1, (int) draft[i], (int) pos, i,
+                    (int) (pos_verify + 1 + (llama_pos) i));
+        }
+    }
+    if (getenv("DSPARK_TRACE_VERIFY")) {
+        fprintf(stderr,
+                "DSPARK_TRACE_VERIFY: batch[0] anchor=%d pos=%d pos_verify=%d draft_n=%zu\n",
+                (int) anchor, (int) pos_verify, (int) pos_verify, draft.size());
     }
 
     const int64_t t0 = timing ? ggml_time_us() : 0;
 
     if (getenv("DSPARK_FUSED_ARGMAX") != nullptr && getenv("DSPARK_GPU_GREEDY") == nullptr) {
-        dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, scratch_seq);
+        dspark_ensure_fused_verify_graph(ctx_tgt, (int32_t) draft.size() + 1, seq_main);
     }
 
-    common_speculative_dspark_target_features_enable(spec, true);
+    // Logits-only verify; layer taps and process() run during commit only.
+    common_speculative_dspark_target_features_enable(spec, layer_taps);
 
     if (defer_layers) {
         llama_set_defer_layer_inp_extract(ctx_tgt, true);
@@ -138,6 +201,7 @@ bool dspark_target_verify_logits(
         if (defer_layers) {
             llama_set_defer_layer_inp_extract(ctx_tgt, false);
         }
+        common_speculative_dspark_target_features_enable(spec, false);
         return false;
     }
 
@@ -145,6 +209,55 @@ bool dspark_target_verify_logits(
         const int64_t t_decode = ggml_time_us();
         timing->decode_submit_ms = 1e-3 * (t_decode - t0);
         timing->logits_decode_ms = timing->decode_submit_ms;
+    }
+
+    if (defer_layers) {
+        llama_set_defer_layer_inp_extract(ctx_tgt, false);
+    }
+
+    if (dspark_verify_canary_enabled()) {
+        llama_synchronize(ctx_tgt);
+        const int n_rows = (int) draft.size() + 1;
+        std::vector<llama_token> batched_toks((size_t) n_rows, LLAMA_TOKEN_NULL);
+        for (int row = 0; row < n_rows; ++row) {
+            batched_toks[(size_t) row] = dspark_greedy_argmax_row(ctx_tgt, row);
+        }
+        const int mismatch_row = dspark_find_first_logit_mismatch(
+                ctx_tgt, mem_tgt, seq_main, pos_verify, anchor, draft, batch, batched_toks);
+        if (mismatch_row >= 0) {
+            fprintf(stderr,
+                    "DSPARK_VERIFY_CANARY: row%d mismatch batched=%d pos_verify=%d anchor=%d draft_n=%zu\n",
+                    mismatch_row, (int) batched_toks[(size_t) mismatch_row],
+                    (int) pos_verify, (int) anchor, draft.size());
+            GGML_ABORT("DSpark parallel verify logits mismatch");
+        }
+
+        dspark_verify_prepare_main(ctx_tgt, mem_tgt, seq_main, pos_verify);
+        common_batch_clear(batch);
+        common_batch_add(batch, anchor, pos_verify, { seq_main }, true);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_main }, true);
+        }
+        if (layer_taps) {
+            common_speculative_dspark_target_features_enable(spec, true);
+        }
+        if (defer_layers) {
+            llama_set_defer_layer_inp_extract(ctx_tgt, true);
+        }
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            if (defer_layers) {
+                llama_set_defer_layer_inp_extract(ctx_tgt, false);
+            }
+            common_speculative_dspark_target_features_enable(spec, false);
+            return false;
+        }
+        if (defer_layers) {
+            llama_set_defer_layer_inp_extract(ctx_tgt, false);
+        }
+    }
+
+    if (!layer_taps) {
+        common_speculative_dspark_target_features_enable(spec, false);
     }
 
     return true;
@@ -207,7 +320,7 @@ void dspark_target_verify_scratch_cleanup(dspark_memory_bundle * mem, llama_pos 
     }
 
     llama_memory_t mem_tgt = llama_get_memory(mem->ctx_tgt);
-    llama_memory_seq_rm(mem_tgt, mem->seq_scratch, pos_verify, -1);
+    llama_memory_seq_rm(mem_tgt, mem->seq_main, pos_verify, -1);
 }
 
 bool dspark_target_commit_tokens(
@@ -325,6 +438,8 @@ bool dspark_target_verify_sequential(
     };
 
     llama_synchronize(ctx_tgt);
+    llama_set_defer_layer_inp_extract(ctx_tgt, false);
+    common_speculative_dspark_target_features_enable(spec, true);
 
     for (size_t i = 0; i <= draft.size(); ++i) {
         const llama_token tok_in = (i == 0) ? anchor : draft[i - 1];
@@ -377,14 +492,6 @@ bool dspark_target_verify_step(
         return dspark_target_verify_sequential(
                 spec, smpl, mem, pos_verify, anchor, draft, out_ids, batch);
     }
-
-    const llama_seq_id scratch = dspark_target_scratch_seq_id(mem->ctx_tgt, mem->seq_main);
-    if (scratch == mem->seq_main) {
-        return dspark_target_verify_sequential(
-                spec, smpl, mem, pos_verify, anchor, draft, out_ids, batch);
-    }
-
-    mem->seq_scratch = scratch;
 
     if (draft.empty()) {
         return dspark_target_commit_one_greedy(

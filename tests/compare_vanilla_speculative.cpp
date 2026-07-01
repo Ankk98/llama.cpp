@@ -545,6 +545,13 @@ int main(int argc, char ** argv) {
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
+    // Vulkan flash-attn multi-token decode diverges from sequential at row 1+ (see smoke_batched_logits_repro).
+    if (use_dspark_spec && getenv("DSPARK_VERIFY_FA") == nullptr
+            && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        fprintf(stderr, "note: DSpark parallel verify requires --flash-attn off; disabling for target ctx\n");
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
     // Scratch verify uses seq_id+1; vanilla reference must use the same n_parallel as spec.
     if (getenv("DSPARK_BENCH_NPARALLEL")) {
         const int bench_np = atoi(getenv("DSPARK_BENCH_NPARALLEL"));
