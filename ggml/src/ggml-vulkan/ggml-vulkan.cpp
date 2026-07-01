@@ -7310,10 +7310,29 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
-        return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+        uint32_t col_idx = num_cols - 1;
+        static const bool consistent_mmv_q =
+                getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+        if (consistent_mmv_q) {
+            col_idx = mul_mat_vec_max_cols - 1;
+        }
+        return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][col_idx];
     }
 
-    return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
+    uint32_t col_idx = num_cols - 1;
+    // DSpark: use the max-columns pipeline for ALL batch widths so that
+    // per-column FP accumulation is identical regardless of ne11.
+    // The per-column specialization constant (NUM_COLS) in the shader
+    // creates different SPIR-V with different unrolling/reduction order;
+    // this forces all widths through the same compiled shader.
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    if (consistent_mmv) {
+        col_idx = mul_mat_vec_max_cols - 1;
+    }
+    return b_type == GGML_TYPE_F32
+            ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][col_idx]
+            : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][col_idx];
 }
 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
