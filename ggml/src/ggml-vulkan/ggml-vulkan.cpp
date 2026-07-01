@@ -8195,11 +8195,22 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         return 1;
     }
 
+    // DSpark: when enforcing numerically-consistent batch-width behaviour,
+    // compute tiling using a fixed n so that split_k does not vary with
+    // batch width. Without this, ne11=1 vs ne11=5 can get different split_k
+    // values, changing the K-dimension reduction order and introducing
+    // per-column FP divergence.
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    const uint32_t n_tile = consistent_mmv
+            ? std::max(n, mul_mat_vec_max_cols) : n;
+    uint32_t n_tiles_eval = CEIL_DIV(n, pipeline->wg_denoms[1]);
+    uint32_t n_tiles_const = CEIL_DIV(n_tile, pipeline->wg_denoms[1]);
+
     uint32_t split_k = 1;
     if (ctx->device->shader_core_count != 0 && m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
-        // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
-        uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+        uint32_t n_tiles = consistent_mmv ? n_tiles_const : n_tiles_eval;
 
         if (k >= 2048) {
             if (m_tiles * n_tiles <= ctx->device->shader_core_count / 2) {
@@ -8233,6 +8244,13 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
+    // DSpark: use a fixed n for pipeline selection so that shader dispatch
+    // does not vary with batch width.
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    const uint32_t n_sel = consistent_mmv
+            ? std::max(n, mul_mat_vec_max_cols) : n;
+
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
@@ -8256,21 +8274,21 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
                             // split_k==3 with large tiles likely better than medium tiles with no split_k.
                             (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
 
-        if ((mm_l && (n > crossover_large && prefer_large)) || (!mm_m && !mm_s)) {
+        if ((mm_l && (n_sel > crossover_large && prefer_large)) || (!mm_m && !mm_s)) {
             return aligned ? mmp->a_l : mmp->l;
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
         uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((mm_m && (n > crossover_medium)) || !mm_s) {
+        if ((mm_m && (n_sel > crossover_medium)) || !mm_s) {
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
+    if ((mm_s && (m <= 32 || n_sel <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
+    if ((mm_m && (m <= 64 || n_sel <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
@@ -8333,6 +8351,11 @@ static void ggml_vk_matmul(
 static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    const uint32_t n_sel = consistent_mmv
+            ? std::max(n, mul_mat_vec_max_cols) : n;
+
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
@@ -8343,21 +8366,21 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
     if (ctx->device->coopmat2) {
         // Use large shader when the N dimension is greater than the medium shader's tile size
         uint32_t crossover_large = mmp->m->wg_denoms[1];
-        if ((mm_l && (n > crossover_large)) || (!mm_m && !mm_s)) {
+        if ((mm_l && (n_sel > crossover_large)) || (!mm_m && !mm_s)) {
             return aligned ? mmp->a_l : mmp->l;
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
         uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((mm_m && (n > crossover_medium)) || !mm_s) {
+        if ((mm_m && (n_sel > crossover_medium)) || !mm_s) {
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
+    if ((mm_s && (m <= 32 || n_sel <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
+    if ((mm_m && (m <= 64 || n_sel <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
