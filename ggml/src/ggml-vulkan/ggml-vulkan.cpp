@@ -7314,7 +7314,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         static const bool consistent_mmv_q =
                 getenv("DSPARK_CONSISTENT_MMV") != nullptr;
         if (consistent_mmv_q) {
-            col_idx = mul_mat_vec_max_cols - 1;
+            col_idx = 0;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][col_idx];
     }
@@ -7328,7 +7328,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     static const bool consistent_mmv =
             getenv("DSPARK_CONSISTENT_MMV") != nullptr;
     if (consistent_mmv) {
-        col_idx = mul_mat_vec_max_cols - 1;
+        col_idx = 0;
     }
     return b_type == GGML_TYPE_F32
             ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][col_idx]
