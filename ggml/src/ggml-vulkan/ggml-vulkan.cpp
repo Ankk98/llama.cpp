@@ -8890,14 +8890,42 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
-    ggml_vk_matmul(
-        ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
-        ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-        ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
-    );  // NOLINT
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    if (consistent_mmv && ne11 > 1 &&
+        src1->ne[2] * src1->ne[3] == 1 &&
+        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16)) {
+        // Column loop: one dispatch per column (batch token) with ne11=1.
+        // Only buffer offsets change; tensor metadata is untouched.
+        const size_t col_stride_y =
+                quantize_y
+                    ? (size_t)ggml_type_size(GGML_TYPE_Q8_1) * (ne10 / ggml_blck_size(GGML_TYPE_Q8_1))
+                    : (qy_needs_dequant
+                          ? (size_t)sizeof(ggml_fp16_t) * ne10
+                          : (size_t)src1->nb[1]);
+        const size_t col_stride_d = (size_t)dst->nb[1];
+        for (uint32_t col = 0; col < (uint32_t)ne11; ++col) {
+            uint64_t y_off = y_buf_offset + col * col_stride_y;
+            uint64_t d_off = d_buf_offset + col * col_stride_d;
+            ggml_vk_matmul(
+                ctx, subctx, pipeline,
+                { d_X, x_buf_offset, x_sz }, { d_Y, y_off, y_sz },
+                ggml_vk_subbuffer(ctx, d_D, d_off), { ctx->prealloc_split_k, 0, d_sz },
+                ne01, 1, ne10,
+                ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+                1, ne12*ne13, ne02, ne12, r2, r3, padded_n
+            );
+        }
+    } else {
+        ggml_vk_matmul(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+            ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
+            ne01, ne11, ne10,
+            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );
+    }
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
@@ -9200,28 +9228,65 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+    // DSpark consistent batch mode: decompose multi-column dispatches into
+    // per-column dispatches (one dispatch per token). The pipeline uses
+    // NUM_COLS=1 (col_idx=0) so each dispatch goes through the exact same
+    // shader path as single-token decode.
+    static const bool consistent_mmv =
+            getenv("DSPARK_CONSISTENT_MMV") != nullptr;
+    if (consistent_mmv && ne11 > 1 && batch_n) {
+        const size_t col_stride_y =
+                quantize_y
+                    ? (size_t)ggml_type_size(GGML_TYPE_Q8_1) * (ne10 / ggml_blck_size(GGML_TYPE_Q8_1))
+                    : ((f16_f32_kernel && !qy_needs_dequant)
+                          ? (size_t)src1->nb[1]
+                          : (size_t)sizeof(ggml_fp16_t) * ne10);
+        const size_t col_stride_d = (size_t)dst->nb[1];
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, ne11 * CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+        for (uint32_t col = 0; col < (uint32_t)ne11; ++col) {
+            vk_subbuffer d_Y_col = d_Y;
+            vk_subbuffer d_D_col = d_D;
+            d_Y_col.offset += col * col_stride_y;
+            d_D_col.offset += col * col_stride_d;
+            uint32_t base_work_group_y = 0;
+            while (base_work_group_y < ne12 * ne13) {
+                uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y,
+                        ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                const vk_mat_vec_push_constants pc = {
+                    (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                    stride_batch_x, stride_batch_y, stride_batch_d,
+                    fusion_flags, base_work_group_y,
+                    (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+                };
+                ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+                                          { d_X, d_Y_col, d_D_col, d_F0, d_F1 },
+                                          pc, { groups_x, groups_y, 1 });
+                base_work_group_y += groups_y;
+            }
+        }
+    } else {
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
 
-    uint32_t base_work_group_y = 0;
-    while (base_work_group_y < ne12 * ne13) {
-
-        uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
-        const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-            stride_batch_x, stride_batch_y, stride_batch_d,
-            fusion_flags, base_work_group_y,
-            (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
-        };
-        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
-                                  {
-                                    d_X,
-                                    d_Y,
-                                    d_D,
-                                    d_F0,
-                                    d_F1,
-                                  },
-                                  pc, { groups_x, groups_y, groups_z });
-        base_work_group_y += groups_y;
+        uint32_t base_work_group_y = 0;
+        while (base_work_group_y < ne12 * ne13) {
+            uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+            const vk_mat_vec_push_constants pc = {
+                (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+                stride_batch_x, stride_batch_y, stride_batch_d,
+                fusion_flags, base_work_group_y,
+                (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+                                      {
+                                        d_X,
+                                        d_Y,
+                                        d_D,
+                                        d_F0,
+                                        d_F1,
+                                      },
+                                      pc, { groups_x, groups_y, groups_z });
+            base_work_group_y += groups_y;
+        }
     }
 
     if (x_non_contig) {
