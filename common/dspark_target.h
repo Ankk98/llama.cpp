@@ -38,7 +38,7 @@ void dspark_target_assert_canonical_kv(
 
 void dspark_target_context_reset(llama_context * ctx);
 
-// Phase A: batched forward on canonical seq; hypothetical tail removed after accept.
+// Phase A: batched forward on scratch seq; canonical KV unchanged.
 bool dspark_target_verify_logits(
         dspark_memory_bundle * mem,
         common_speculative * spec,
@@ -56,7 +56,7 @@ llama_tokens dspark_target_accept_chain(
         const std::vector<std::vector<float>> * draft_probs = nullptr,
         float temp = 0.0f);
 
-// Discard hypothetical verify tail on canonical seq after accept.
+// Discard hypothetical verify tail on scratch seq after accept.
 void dspark_target_verify_scratch_cleanup(
         dspark_memory_bundle * mem,
         llama_pos pos_verify);

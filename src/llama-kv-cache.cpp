@@ -5,13 +5,26 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <vector>
+
+static bool llama_kv_zero_on_rm_enabled() {
+    const char * v = getenv("LLAMA_KV_ZERO_ON_RM");
+    if (v && v[0] && v[0] != '0') {
+        return true;
+    }
+    v = getenv("DSPARK_KV_ZERO_ON_RM");
+    return v && v[0] && v[0] != '0';
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -392,6 +405,26 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+void llama_kv_cache::zero_cell(uint32_t stream, uint32_t cell_idx) {
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream[stream];
+        if (k) {
+            const size_t row_bytes = ggml_row_size(k->type, k->ne[0]);
+            const size_t off       = (size_t) cell_idx * row_bytes;
+            std::vector<uint8_t> zeros(row_bytes, 0);
+            ggml_backend_tensor_set(k, zeros.data(), off, row_bytes);
+        }
+
+        ggml_tensor * v = layer.v_stream[stream];
+        if (v) {
+            const size_t row_bytes = ggml_row_size(v->type, v->ne[0]);
+            const size_t off       = (size_t) cell_idx * row_bytes;
+            std::vector<uint8_t> zeros(row_bytes, 0);
+            ggml_backend_tensor_set(v, zeros.data(), off, row_bytes);
+        }
+    }
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -409,8 +442,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t strm = seq_to_stream[seq_id];
+        auto & cells = v_cells[strm];
+        auto & head  = v_heads[strm];
 
         uint32_t new_head = cells.size();
 
@@ -420,6 +454,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                if (llama_kv_zero_on_rm_enabled()) {
+                    zero_cell(strm, i);
+                }
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -444,6 +481,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+
+                if (llama_kv_zero_on_rm_enabled()) {
+                    zero_cell(s, i);
+                }
 
                 if (new_head == cells.size()) {
                     new_head = i;

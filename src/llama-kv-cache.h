@@ -292,6 +292,8 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
+    void zero_cell(uint32_t stream, uint32_t cell_idx);
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,

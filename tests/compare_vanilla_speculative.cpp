@@ -540,8 +540,12 @@ int main(int argc, char ** argv) {
     }
 
     const bool has_draft = !bflags.vanilla_only && !params.speculative.draft.mparams.path.empty();
-    if (has_draft && params.speculative.types.empty()) {
-        params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+    if (has_draft) {
+        const bool only_none = params.speculative.types.size() == 1
+                && params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
+        if (params.speculative.types.empty() || only_none) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        }
     }
     const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
 
@@ -562,6 +566,12 @@ int main(int argc, char ** argv) {
     } else if (use_dspark_spec && params.n_parallel < 2) {
         fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
         params.n_parallel = 2;
+    }
+
+    if (use_dspark_spec
+            && getenv("DSPARK_KV_ZERO_ON_RM") == nullptr
+            && getenv("LLAMA_KV_ZERO_ON_RM") == nullptr) {
+        setenv("DSPARK_KV_ZERO_ON_RM", "1", 0);
     }
 
     llama_backend_init();
