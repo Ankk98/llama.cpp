@@ -375,3 +375,39 @@ with the larger shared memory footprint affect reduction order).
 The column-loop approach avoids this entirely (NUM_COLS=1 always) but
 needs descriptor pool pre-sizing + watchdog handling in the Vulkan
 backend. Estimated <100 lines of additional C++.
+
+## Column loop fix for matmul ops (2026-07-01)
+
+### Problem
+Batched matmuls (ne11 > 1) use different Vulkan pipeline variants and
+workgroup dispatch dimensions than single-token matmuls (ne11 = 1). This
+produces slightly different floating-point accumulation, which accumulates
+over layers and generation steps, eventually flipping argmax.
+
+### Column loop approach
+For each matmul dispatch function, add a loop over the batch dimension (ne11)
+that dispatches ONE column at a time using buffer-offset-only adjustments
+(no tensor metadata modification):
+
+- **ggml_vk_mul_mat_q_f16 (matmul path)**: Loop over ne11 columns, each
+  dispatch with ne11 = 1, adjusted Y and D buffer offsets. Only triggers for
+  safe cases (src1 type f32/f16, src1 ne[2]*ne[3] == 1).
+- **ggml_vk_mul_mat_vec_q_f16 (mmvq path)**: Loop over ne11 columns, each
+  dispatch with groups_z = 1, adjusted Y and D subbuffer offsets.
+- **Pipeline selection fix**: col_idx = 0 for all CONSISTENT_MMV paths,
+  ensuring NUM_COLS = 1 pipeline variant (matching single-token).
+
+### Result
+- **Smoke scan**: 0 mismatches through 90 steps (all matmuls identical)
+- **MAINSEQ pipeline**: Token-match for first ~40 steps, diverges at gen 41
+  due to non-matmul ops (softmax, elementwise, RMSNorm) still having
+  batch-width-dependent dispatch.
+- **Speedup**: 0.62x on code_500l (overhead from per-column dispatches)
+
+### Remaining issue
+Non-matmul ops (softmax, add, rms_norm, etc.) on Vulkan still process
+different batch widths through different workgroup configurations.
+Complete fix requires graph-build-level op decomposition for all Vulkan ops.
+
+### Key files changed (commit `e393edac` `a329b36`)
+- `ggml/src/ggml-vulkan/ggml-vulkan.cpp`: Column loops in both matmul paths
