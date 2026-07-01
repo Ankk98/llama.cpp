@@ -307,3 +307,71 @@ not yet addressed.
 **Status**: MAINSEQ path 1.57x on code_500l (match True), diverges on
 lower-accept prompts. Root cause is Vulkan backend n_tokens-dependent
 numerics across the FULL forward pass, not just lm_head or mul_mat_vec.
+
+## 2026-07-01: Vulkan backend shortcut approach
+
+After fixing mul_mat_vec (pipeline specialization constant), mul_mat_q
+(split_k, pipeline selection), and the graph gather, MAINSEQ still
+diverges (gen 41/73). The remaining divergence is in non-matmul ops
+(soft_max, elementwise, attention-specific paths) that also have
+n_tokens-dependent workgroup dispatch.
+
+Instead of fixing every op individually, try: force all dispatches
+to use ne11=1 internally, with the shader/backend iterating over
+columns in a loop. This makes every Vulkan operation use the exact
+same numerical path as single-token decode, regardless of batch width.
+
+Implementation approach: in ggml_vk_mul_mat_vec_q_f16 and
+ggml_vk_mul_mat_q_f16, when DSPARK_CONSISTENT_MMV=1 and ne11>1,
+loop over columns, dispatching each as ne11=1 with appropriate
+buffer offsets, all within the same command buffer (no inter-
+dispatch sync). This keeps the graph intact (one op with ne11=N)
+but makes the backend see ne11=1 for every dispatch.
+
+## 2026-07-01: Column-loop experiment (Vulkan shortcut)
+
+Approach: CPU-driven column loop in ggml_vk_mul_mat_vec_q_f16. When
+DSPARK_CONSISTENT_MMV=1 and ne11>1, dispatch N separate dispatches
+each with NUM_COLS=1 (single-column pipeline, identical shared memory
+layout as single-token decode), iterating over columns with buffer
+offsets. All dispatches in one command buffer, no inter-dispatch sync.
+
+Status: CRASHES (vk::DeviceLostError). The column loop requires:
+- 5× more descriptor sets per node (descriptor pool exhaustion)
+- 5× more dispatches per command buffer (potential watchdog timeout)
+
+Fix would need: descriptor pool pre-sizing for N× dispatches, and
+potentially splitting the command buffer to avoid timeout.
+
+The approach is correct in theory (keeps NUM_COLS=1, shared memory
+identical to single-token) but needs backend-level descriptor pool
+management.
+
+## Summary of 5 commits
+
+1. **d0b263921** - Graph fix: remove inp_out_ids gather from last layer
+   (qwen3.cpp, gemma4.cpp). This was the PRIMARY fix for batched
+   logits matching sequential logits (0 mismatches in smoke scan).
+
+2. **d0b263921** - Timing fix: dspark_now_ms() was 1000× too small.
+
+3. **5674248c** - Pipeline simplified to main-seq batched verify
+   (DFlash style). 1.57× on code_500l, diverges on low-accept prompts.
+
+4. **26add48dd** - CONSISTENT_MMV for mul_mat_vec: force all ne11
+   values to use the same pipeline for consistent per-column FP.
+
+5. **e010e365d** - CONSISTENT_MMV for non-vector matmul: split_k and
+   pipeline selection use consistent n for all batch widths.
+
+## Remaining problem
+
+CONSISTENT_MMV makes logits match (smoke scan passes), but KV from
+batched decode still differs from single-token KV on Vulkan, because
+shared memory occupancy changes with NUM_COLS (the pipeline selection
+fix keeps FP consistent per-column, but workgroup scheduling changes
+with the larger shared memory footprint affect reduction order).
+
+The column-loop approach avoids this entirely (NUM_COLS=1 always) but
+needs descriptor pool pre-sizing + watchdog handling in the Vulkan
+backend. Estimated <100 lines of additional C++.
