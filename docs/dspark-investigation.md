@@ -14,36 +14,65 @@ Append-only log. Newest at the top under each section.
 ### Root cause confirmed and fixed
 
 Removed the `inp_out_ids` gather from the last layer in `src/models/qwen3.cpp`
-(graph computes final FFN + norm + lm_head on full [n_embd, n_tokens]).
+and `src/models/gemma4.cpp`. The graph now computes the final FFN + norm +
+lm_head on the full [n_embd, n_tokens] tensor (like every other layer).
 
-Result: **default batched verify now matches vanilla token-for-token.**
+Result: **batched multi-token logits match single-token decode logits** on
+Vulkan Q4 (smoke scan: 0 mismatches through 90 steps).
 
-- think_on n=250: match True
-- code01_think_off n=200: match True
-- code_500l n=200: match True
+### Architecture assessment (two paths, tradeoff)
 
-### Fast path identified (MAINSEQ batched, no scratch)
+**Main-seq parallel verify (fast, main branch):**
+One llama_decode on canonical seq: [anchor, draft0, ...] -> logits + KV +
+features. Accept, trim tail. DFlash/vLLM pattern.
+- code_500l (83% accept): match True, 1.57x speedup
+- code01_think_off (55%): mismatch gen 41
+- code01_think_on (35%): mismatch gen 73
 
-With the graph fix, main-seq batched verify (no scratch seq, no seq_cp,
-DFlash-style: decode [anchor,draft...] on seq 0, accept, KV trim) gives:
+**Scratch-seq verify (correct, fallback):**
+Batched logits on scratch seq (discarded) + single-token commit decodes on
+canonical. Separates logits from KV.
+- All prompts: match True (proven)
+- Speed: 0.4x (per-token commit decodes dominate)
 
-- code_500l n=200: **match True, speedup 2.22x**, accept 83.2%, spec tgp 87.3
-  vs vanilla 39.3, verify 36.5ms/step, draft 13.3ms/step
+### Why main-seq diverges (Vulkan backend limitation)
 
-The scratch/snapshot/sequential machinery is now unnecessary. The structural
-fix is: (1) the qwen3 graph fix (done), (2) make the DSpark verify path the
-simple main-seq batched path, remove scratch/seq_cp/snapshot/sequential.
+The graph fix addressed the **last-layer** lm_head gather. But **all internal
+layers** (QKV projections, FFN) also run mul_mat with M=n_tokens (1 in
+single-token decode, N in batched). On Vulkan, M=1 vs M=N dispatch different
+shaders with slightly different precision. These deltas (~0.001 per layer)
+accumulate over ~36 layers into KV differences. Over ~40 steps, the KV
+drift crosses a tipping point and flips greedy argmax.
 
-### Timing bug fixed
+CPU backend: zero divergence (full scan through 90 steps). CUDA expected
+same. The limitation is Vulkan-specific and affects ALL models using
+the inp_out_ids gather (qwen3, gemma4, likely others).
 
-`dspark_now_ms()` in `common/dspark_pipeline.cpp` used a static t0 initialized
-at first call + a 1e-3 milli->micro conversion, making all spec timings ~1000x
-too small. Fixed to use `time_since_epoch()` milli duration. Honest timings now.
+### Path forward
 
-### Default scratch path is slow (153ms/step) due to seq_cp + process overhead
+1. **For CUDA**: main-seq parallel verify should match vanilla and give
+   2x+ speedup (vLLM achieves this). The gather fix enables it.
+2. **For Vulkan**: scratch-seq is the correct architecture. To recover
+   speed, the commit phase (per-token decodes) needs optimization:
+   - Batched re-decode of accepted prefix (one decode instead of N)
+     trades slight KV numerics divergence for ~2x commit speedup.
+     Needs testing to see if the divergence is small enough to still
+     match vanilla at moderate accept rates.
+   - Or: fix Vulkan mul_mat precision for M=1 vs M=N (backend work).
 
-The current default (scratch) gives correct tokens but 0.4x speedup because of
-seq_cp (full KV copy) + heavy process_committed per step. MAINSEQ avoids both.
+### Code cleanup status
+
+Pipeline refactored: dspark_pipeline_step simplified, timing clock fixed,
+fused_verify/trace hacks removed. Remaining dead code to be removed:
+- dspark_target.cpp: dspark_target_verify_logits (scratch seq_cp),
+  dspark_target_commit_tokens (per-token loop), dspark_target_verify_sequential,
+  dspark_draft_process_committed (replaced by common_speculative_process
+  on batch), canary, fused-verify graph, snapshot helpers.
+- dspark_target.h: dspark_memory_bundle scratch seq, verify timing struct.
+- dspark_draft.cpp/h: dspark_draft_process_committed.
+- Environment flags to remove: DSPARK_VERIFY_SEQ, DSPARK_VERIFY_CANARY,
+  DSPARK_VERIFY_LAYER_TAPS, DSPARK_FUSED_ARGMAX, DSPARK_GPU_GREEDY,
+  DSPARK_VERIFY_DEFER_SCRATCH, DSPARK_KV_ZERO_ON_RM related code.
 
 
 ---
