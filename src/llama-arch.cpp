@@ -315,6 +315,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MARKOV_HEAD_TYPE,            "%s.markov_head_type"            },
     { LLM_KV_ENABLE_CONFIDENCE_HEAD,      "%s.enable_confidence_head"      },
     { LLM_KV_CONFIDENCE_HEAD_WITH_MARKOV, "%s.confidence_head_with_markov" },
+    { LLM_KV_ATTENTION_K_EQ_V,            "%s.attention_k_eq_v"            },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims

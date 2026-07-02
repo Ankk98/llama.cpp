@@ -98,6 +98,12 @@ add_library(${TARGET}
     reasoning-budget.h
     sampling.cpp
     sampling.h
+    dspark_draft.cpp
+    dspark_draft.h
+    dspark_pipeline.cpp
+    dspark_pipeline.h
+    dspark_target.cpp
+    dspark_target.h
     speculative.cpp
     speculative.h
     unicode.cpp

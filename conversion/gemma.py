@@ -797,6 +797,7 @@ class Gemma4DSparkModel(Gemma4Model):
             self.gguf_writer.add_target_layers(extract_layer_ids)
 
         self.gguf_writer.add_causal_attention(False)
+        self.gguf_writer.add_attention_k_eq_v(bool(self.hparams.get("attention_k_eq_v", True)))
 
         markov_rank = int(self.hparams.get("markov_rank", 0))
         self.gguf_writer.add_markov_rank(markov_rank)

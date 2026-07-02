@@ -130,6 +130,9 @@ flake.lock
 /hellaswag_val_full.txt
 /winogrande-debiased-eval.csv
 /wikitext-2-raw/
+/scripts/dspark-vps/eval/qwen3/expected/
+/scripts/dspark-vps/eval/qwen3/runs/
+/scripts/dspark-vps/eval/qwen3/*.csv
 
 # Test models for lora adapters
 

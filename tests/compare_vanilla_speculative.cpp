@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "dspark_pipeline.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "log.h"
@@ -15,6 +16,14 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+
+struct bench_flags {
+    bool vanilla_only = false;
+    bool spec_only    = false;
+    std::string reference_path;
+    std::string save_output_path;
+    std::string json_results_path;
+};
 
 struct run_stats {
     std::vector<llama_token> output;
@@ -38,14 +47,184 @@ struct run_stats {
 static void usage(const char * argv0) {
     fprintf(stderr,
             "Usage: %s -m TARGET.gguf [-md DRAFT.gguf] --input-ids PATH "
-            "[--temp 0] [--seed 42] [-n 32] [-c 512] [-ngl N] [-ngld N]\n",
+            "[--temp 0] [--seed 42] [-n 32] [-c 512] [-ngl N] [-ngld N]\n"
+            "       [--vanilla-only] [--spec-only] [--reference PATH.json]\n"
+            "       [--save-output PATH.json] [--json-results PATH.json]\n",
             argv0);
+}
+
+static bool io_save_tokens(const std::string & path, const std::vector<llama_token> & toks) {
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f) {
+        return false;
+    }
+    fprintf(f, "[");
+    for (size_t i = 0; i < toks.size(); ++i) {
+        fprintf(f, "%s%d", i ? "," : "", (int) toks[i]);
+    }
+    fprintf(f, "]\n");
+    fflush(f);
+    fclose(f);
+    return true;
+}
+
+static bool compare_generated_prefix(
+        const std::vector<llama_token> & ref,
+        const std::vector<llama_token> & out,
+        size_t n_inp,
+        size_t * first_mismatch_gen) {
+    const size_t n_cmp = std::min(ref.size(), out.size());
+    size_t first_mismatch = n_cmp;
+    for (size_t i = n_inp; i < n_cmp; ++i) {
+        if (ref[i] != out[i]) {
+            first_mismatch = i;
+            break;
+        }
+    }
+    if (first_mismatch_gen) {
+        *first_mismatch_gen = first_mismatch == n_cmp ? (size_t) -1 : first_mismatch - n_inp;
+    }
+    return first_mismatch == n_cmp;
+}
+
+static void write_json_results(
+        FILE * f,
+        const common_params & params,
+        size_t n_inp,
+        const run_stats * vanilla,
+        const run_stats * spec,
+        const std::vector<llama_token> * reference,
+        bool token_match,
+        ssize_t first_mismatch_gen) {
+    const auto write_run = [&](const char * key, const run_stats & s, bool is_spec) {
+        const double pp  = s.pp_ms  > 0 ? 1000.0 * s.n_prompt    / s.pp_ms  : 0.0;
+        const double tgp = s.gen_ms > 0 ? 1000.0 * s.n_generated / s.gen_ms : 0.0;
+        fprintf(f, "\"%s\":{", key);
+        fprintf(f, "\"pp_ms\":%.4f,\"gen_ms\":%.4f,\"pp_tok_s\":%.4f,\"tgp_tok_s\":%.4f,",
+                s.pp_ms, s.gen_ms, pp, tgp);
+        fprintf(f, "\"n_prompt\":%d,\"n_generated\":%d", s.n_prompt, s.n_generated);
+        if (is_spec) {
+            const double accept_rate = s.n_drafted > 0 ? 100.0 * s.n_accepted / s.n_drafted : 0.0;
+            const double mean_acc = s.n_propose_steps > 0
+                    ? (double) s.n_accepted / (double) s.n_propose_steps : 0.0;
+            const double d_step = s.n_propose_steps > 0 ? s.draft_ms / s.n_propose_steps : 0.0;
+            const double vf_step = s.n_propose_steps > 0 ? s.verify_ms / s.n_propose_steps : 0.0;
+            const double tok_step = s.n_propose_steps > 0
+                    ? (double) s.n_generated / s.n_propose_steps : 0.0;
+            const double v_fwd = vanilla && vanilla->n_generated > 0
+                    ? vanilla->gen_ms / vanilla->n_generated : 0.0;
+            fprintf(f, ",\"n_propose_steps\":%d,\"n_drafted\":%d,\"n_accepted\":%d",
+                    s.n_propose_steps, s.n_drafted, s.n_accepted);
+            fprintf(f, ",\"accept_rate_pct\":%.4f,\"mean_accepted_per_step\":%.4f",
+                    accept_rate, mean_acc);
+            fprintf(f, ",\"ms_per_step_draft\":%.4f,\"ms_per_step_verify\":%.4f",
+                    d_step, vf_step);
+            fprintf(f, ",\"ms_per_step_logits_decode\":%.4f",
+                    s.n_propose_steps > 0
+                        ? (s.tgt_decode_ms - s.verify_features_ms) / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_step_decode_submit\":%.4f",
+                    s.n_propose_steps > 0 ? s.verify_decode_submit_ms / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_step_accept\":%.4f",
+                    s.n_propose_steps > 0 ? s.verify_accept_ms / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_step_layer_commit\":%.4f",
+                    s.n_propose_steps > 0 ? s.verify_layer_commit_ms / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_step_feature_redecode\":%.4f",
+                    s.n_propose_steps > 0 ? s.verify_features_ms / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_step_process\":%.4f",
+                    s.n_propose_steps > 0 ? s.verify_process_ms / s.n_propose_steps : 0.0);
+            fprintf(f, ",\"ms_per_propose_total\":%.4f,\"tokens_per_propose\":%.4f",
+                    d_step + vf_step, tok_step);
+            fprintf(f, ",\"ms_per_token_effective\":%.4f",
+                    tok_step > 0 ? (d_step + vf_step) / tok_step : 0.0);
+            fprintf(f, ",\"ms_per_token_vanilla_fwd\":%.4f", v_fwd);
+            fprintf(f, ",\"draft_ms_total\":%.4f,\"verify_ms_total\":%.4f",
+                    s.draft_ms, s.verify_ms);
+        }
+        fputc('}', f);
+    };
+
+    fprintf(f, "{");
+    fprintf(f, "\"temp\":%.4f,\"seed\":%u,\"n_predict\":%d,\"n_prompt_tokens\":%zu,\"n_ctx\":%d,",
+            params.sampling.temp, params.sampling.seed, params.n_predict, n_inp, params.n_ctx);
+    fprintf(f, "\"confidence_threshold\":%.6f,\"n_max\":%d,",
+            params.speculative.dspark_confidence_threshold,
+            params.speculative.draft.n_max);
+    if (vanilla) {
+        write_run("vanilla", *vanilla, false);
+        fprintf(f, ",");
+    }
+    if (spec) {
+        write_run("spec", *spec, true);
+        fprintf(f, ",");
+    }
+    fprintf(f, "\"token_match\":%s,", token_match ? "true" : "false");
+    if (first_mismatch_gen >= 0) {
+        fprintf(f, "\"first_mismatch_gen\":%zd,", first_mismatch_gen);
+    } else {
+        fprintf(f, "\"first_mismatch_gen\":null,");
+    }
+    if (vanilla && spec) {
+        const double tgp_v = vanilla->gen_ms > 0 ? 1000.0 * vanilla->n_generated / vanilla->gen_ms : 0.0;
+        const double tgp_s = spec->gen_ms > 0 ? 1000.0 * spec->n_generated / spec->gen_ms : 0.0;
+        fprintf(f, "\"tgp_speedup\":%.6f", tgp_v > 0 && tgp_s > 0 ? tgp_s / tgp_v : 0.0);
+    } else {
+        fprintf(f, "\"tgp_speedup\":null");
+    }
+    if (reference) {
+        fprintf(f, ",\"reference_tokens\":%zu", reference->size());
+    }
+    fprintf(f, "}\n");
+    fflush(f);
 }
 
 static double now_ms() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(
             clock::now().time_since_epoch()).count();
+}
+
+static bool ctx_save_state(llama_context * ctx, std::vector<uint8_t> & buf) {
+    const size_t sz = llama_state_get_size(ctx);
+    buf.resize(sz);
+    return llama_state_get_data(ctx, buf.data(), sz) == sz;
+}
+
+static bool ctx_restore_state(llama_context * ctx, const std::vector<uint8_t> & buf) {
+    return llama_state_set_data(ctx, buf.data(), buf.size()) == buf.size();
+}
+
+// Vanilla target-only greedy tokens: sequential one-decode-per-token from saved KV.
+static llama_tokens vanilla_oracle_chain(
+        llama_context * ctx_tgt,
+        llama_batch & batch,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        size_t n_tokens) {
+    llama_tokens out;
+    out.reserve(n_tokens);
+
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, pos_verify, -1);
+
+    llama_token tok_in = anchor;
+    for (size_t i = 0; i < n_tokens; ++i) {
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_in, pos_verify + (llama_pos) i, { seq_id }, true);
+        if (llama_decode(ctx_tgt, batch) != 0) {
+            break;
+        }
+        llama_synchronize(ctx_tgt);
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const float * logits = llama_get_logits_ith(ctx_tgt, 0);
+        if (!logits) {
+            break;
+        }
+        const llama_token id = common_sampler_greedy_argmax(logits, n_vocab);
+        out.push_back(id);
+        tok_in = id;
+    }
+    return out;
 }
 
 static int run_vanilla(
@@ -59,9 +238,9 @@ static int run_vanilla(
 
     llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-#if defined(GGML_USE_CUDA)
-    // Match spec KV layout: full-prompt prefill + first-token sample (CUDA vanilla
-    // single-token prefill diverges from spec verify around gen index 34).
+    // Match spec KV layout: full-prompt prefill + first-token sample. The old
+    // inp.size()-1 prefill diverged from DSpark spec verify on Vulkan (e.g. Qwen3
+    // agentic mismatch around gen 78).
     llama_token id_last = inp.back();
     int n_past = (int) inp.size();
 
@@ -81,19 +260,6 @@ static int run_vanilla(
     out->output = inp;
     out->output.push_back(id_last);
     out->n_generated = 1;
-#else
-    llama_token id_last = inp.back();
-    int n_past = (int) inp.size() - 1;
-
-    llama_batch prefill = llama_batch_get_one(inp.data(), (int) inp.size() - 1);
-    out->n_prompt = (int) inp.size() - 1;
-    const double tpp = now_ms();
-    llama_decode(ctx_tgt, prefill);
-    out->pp_ms = now_ms() - tpp;
-
-    out->output = inp;
-    out->n_generated = 0;
-#endif
 
     const double t0 = now_ms();
 
@@ -116,11 +282,59 @@ static int run_vanilla(
 
     out->gen_ms = now_ms() - t0;
     llama_batch_free(batch);
-    llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+    common_speculative_dspark_context_reset(ctx_tgt);
     return 0;
 }
 
-static int run_speculative(
+static bool params_use_dspark_spec(const common_params & params) {
+    for (auto t : params.speculative.types) {
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool verify_standard_batched(
+        common_speculative * spec,
+        common_sampler * smpl,
+        llama_context * ctx_tgt,
+        llama_seq_id seq_id,
+        llama_pos pos_verify,
+        llama_token anchor,
+        const llama_tokens & draft,
+        llama_tokens & out_ids,
+        llama_batch & batch) {
+    out_ids.clear();
+
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify, -1);
+
+    common_batch_clear(batch);
+    common_batch_add(batch, anchor, pos_verify, { seq_id }, true);
+    for (size_t i = 0; i < draft.size(); ++i) {
+        common_batch_add(batch, draft[i], pos_verify + 1 + (llama_pos) i, { seq_id }, true);
+    }
+
+    if (llama_decode(ctx_tgt, batch) != 0) {
+        return false;
+    }
+
+    if (spec != nullptr) {
+        common_speculative_process(spec, batch);
+    }
+
+    out_ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+    if (out_ids.empty()) {
+        return false;
+    }
+
+    llama_memory_seq_rm(mem_tgt, seq_id, pos_verify + (llama_pos) out_ids.size(), -1);
+    return true;
+}
+
+// Generic speculative loop (draft-mtp, draft-simple, etc.) without DSpark verify/process.
+static int run_speculative_standard(
         common_params & params,
         llama_context * ctx_tgt,
         llama_context * ctx_dft,
@@ -135,93 +349,36 @@ static int run_speculative(
     int n_past = (int) inp.size();
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+    llama_batch prefill   = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
-    // warmup target graphs at verify batch size (n_max + 1 tokens)
-    if (!getenv("DSPARK_NO_WARMUP")) {
-        const int32_t n_verify = params.speculative.draft.n_max + 1;
-        llama_batch warm = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-        const llama_token warm_tok = inp.empty() ? 0 : inp[0];
-        for (int32_t i = 0; i < n_verify; ++i) {
-            common_batch_add(warm, warm_tok, (llama_pos) i, { 0 }, true);
-        }
-        llama_decode(ctx_tgt, warm);
-        llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
-        if (ctx_feat) {
-            llama_decode(ctx_feat, warm);
-        }
-        llama_synchronize(ctx_tgt);
-        llama_batch_free(warm);
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
-        if (ctx_feat) {
-            llama_memory_seq_rm(llama_get_memory(ctx_feat), 0, 0, -1);
-        }
-    }
-
-    // Prefill the FULL prompt and sample the first token from the target, then draft from
-    // it (mirrors DeepSpec). This avoids a cold start where the last prompt token's target
-    // features are not yet injected into ctx_dft on the first draft - that missing context
-    // row makes the draft degenerate (repeat the anchor) for the first few steps.
-    // common_speculative_process() reads pos/seq_id/n_seq_id directly, so the prefill batch
-    // must be fully formed (llama_batch_get_one leaves those arrays null).
-    llama_batch prefill = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
     for (size_t i = 0; i < inp.size(); ++i) {
         common_batch_add(prefill, inp[i], (llama_pos) i, { 0 }, i + 1 == inp.size());
     }
     out->n_prompt = (int) inp.size();
     const double tpp = now_ms();
-    llama_context * const ctx_feat = params.speculative.draft.ctx_tgt_feat;
-    llama_context * const ctx_prefill = ctx_tgt;
-    const bool prefill_defer = getenv("DSPARK_PREFILL_DEFER") != nullptr;
-    if (prefill_defer) {
-        llama_set_defer_layer_inp_extract(ctx_prefill, true);
-    }
-    llama_decode(ctx_prefill, prefill);
-    if (ctx_feat) {
-        llama_decode(ctx_feat, prefill);
-    }
-        if (prefill_defer) {
-            llama_commit_layer_inputs(ctx_prefill, inp.size());
-            llama_set_defer_layer_inp_extract(ctx_prefill, false);
-        }
-        if (!getenv("DSPARK_NO_PREFILL_PROCESS")) {
-            common_speculative_process(spec, prefill);
-        }
-    if (!getenv("DSPARK_NO_BEGIN")) {
-        common_speculative_begin(spec, 0, prompt_tgt);
-    }
+    llama_decode(ctx_tgt, prefill);
+    common_speculative_process(spec, prefill);
+    common_speculative_begin(spec, 0, prompt_tgt);
 
     llama_token id_last = common_sampler_sample(smpl, ctx_tgt, -1, false);
     common_sampler_accept(smpl, id_last, true);
     out->pp_ms = now_ms() - tpp;
 
-    // fused verify skips full-vocab logits D2H; enable after prefill first sample
-    const bool fused_verify = getenv("DSPARK_FUSED_ARGMAX") != nullptr
-            && getenv("DSPARK_GPU_GREEDY") == nullptr;
-    if (fused_verify) {
-        llama_set_skip_host_logits(ctx_tgt, true);
-    }
-
     out->output = inp;
     out->output.push_back(id_last);
-    out->n_generated++;
+    out->n_generated = 1;
+
     llama_tokens draft;
     const double t0 = now_ms();
 
     while (!llama_vocab_is_eog(vocab, id_last) && out->n_generated < n_predict) {
-        auto spec_params = params.speculative;
-        spec_params.dspark_temp = params.sampling.temp;
-        spec_params.dspark_seed = params.sampling.seed;
-        common_speculative_sync_params(spec, spec_params);
-
         draft.clear();
-        if (!getenv("DSPARK_NO_DRAFT")) {
-            common_speculative_get_draft_params(spec, 0) = {
-                true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
-            };
-            const double td0 = now_ms();
-            common_speculative_draft(spec);
-            out->draft_ms += now_ms() - td0;
-        }
+        common_speculative_get_draft_params(spec, 0) = {
+            true, -1, n_past, id_last, &prompt_tgt, &draft, nullptr,
+        };
+        const double td0 = now_ms();
+        common_speculative_draft(spec);
+        out->draft_ms += now_ms() - td0;
 
         out->n_propose_steps++;
         out->n_drafted += (int) draft.size();
@@ -230,44 +387,15 @@ static int run_speculative(
         llama_tokens ids;
         const double tv0 = now_ms();
 
-        if (getenv("DSPARK_VANILLA_VERIFY")) {
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, id_last, pos_verify, { 0 }, true);
-            llama_decode(ctx_tgt, batch_tgt);
-            const llama_token next = common_sampler_sample(smpl, ctx_tgt, -1, false);
-            common_sampler_accept(smpl, next, true);
-            ids.assign(1, next);
-        } else {
-            common_speculative_dspark_verify_timing vtim {};
-            if (!common_speculative_dspark_verify_batched(
-                    spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt, &vtim)) {
-                fprintf(stderr, "error: dspark verify failed\n");
-                return 1;
-            }
-            out->tgt_decode_ms     += vtim.logits_decode_ms + vtim.features_decode_ms;
-            out->verify_accept_ms  += vtim.accept_ms;
-            out->verify_layer_commit_ms += vtim.layer_commit_ms;
-            out->verify_features_ms += vtim.features_decode_ms;
-            out->verify_process_ms += vtim.process_ms;
-            out->verify_decode_submit_ms += vtim.decode_submit_ms;
+        if (!verify_standard_batched(spec, smpl, ctx_tgt, 0, pos_verify, id_last, draft, ids, batch_tgt)) {
+            fprintf(stderr, "error: standard verify failed\n");
+            return 1;
         }
 
         out->verify_ms += now_ms() - tv0;
 
         const int n_acc = (int) ids.size() - 1;
         out->n_accepted += n_acc;
-
-        if (getenv("DSPARK_DEBUG")) {
-            fprintf(stderr, "\n[step %2d] anchor='%s'\n", out->n_propose_steps,
-                    common_token_to_piece(ctx_tgt, id_last, true).c_str());
-            fprintf(stderr, "  proposed (%d):", (int) draft.size());
-            for (auto d : draft) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, d, true).c_str());
-            fprintf(stderr, "\n  accepted %d/%d:", n_acc, (int) draft.size());
-            for (int i = 0; i < n_acc; ++i) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, draft[i], true).c_str());
-            fprintf(stderr, "\n  committed (+bonus):");
-            for (auto t : ids) fprintf(stderr, " '%s'", common_token_to_piece(ctx_tgt, t, true).c_str());
-            fputc('\n', stderr);
-        }
 
         if (n_acc > 0) {
             common_speculative_accept(spec, 0, (uint16_t) n_acc);
@@ -284,8 +412,8 @@ static int run_speculative(
             }
         }
 
-        if (!getenv("DSPARK_NO_KV_TRIM")) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
+        if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1);
         }
 
@@ -298,8 +426,43 @@ static int run_speculative(
     llama_batch_free(batch_tgt);
     llama_batch_free(prefill);
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
-    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    if (ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
+    }
     return 0;
+}
+
+static int run_speculative(
+        common_params & params,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_sampler * smpl,
+        common_speculative * spec,
+        std::vector<llama_token> & inp,
+        int n_predict,
+        run_stats * out) {
+    dspark_run_stats dstats {};
+    const int rc = dspark_pipeline_run(params, spec, smpl, ctx_tgt, ctx_dft, inp, n_predict, &dstats)
+            ? 0 : 1;
+
+    out->output                  = std::move(dstats.output);
+    out->pp_ms                   = dstats.pp_ms;
+    out->gen_ms                  = dstats.gen_ms;
+    out->draft_ms                = dstats.draft_ms;
+    out->verify_ms               = dstats.verify_ms;
+    out->tgt_decode_ms           = dstats.tgt_decode_ms;
+    out->verify_accept_ms        = dstats.verify_accept_ms;
+    out->verify_layer_commit_ms  = dstats.verify_layer_commit_ms;
+    out->verify_features_ms      = dstats.verify_features_ms;
+    out->verify_decode_submit_ms = dstats.verify_decode_submit_ms;
+    out->verify_process_ms       = dstats.verify_process_ms;
+    out->n_prompt                = dstats.n_prompt;
+    out->n_generated             = dstats.n_generated;
+    out->n_drafted               = dstats.n_drafted;
+    out->n_accepted              = dstats.n_accepted;
+    out->n_propose_steps         = dstats.n_propose_steps;
+
+    return rc;
 }
 
 static void print_tokens(const char * label, const std::vector<llama_token> & toks, size_t skip) {
@@ -324,15 +487,31 @@ int main(int argc, char ** argv) {
     common_init();
 
     std::string input_ids_path;
+    bench_flags bflags;
 
     std::vector<char *> fargv;
     fargv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--input-ids") == 0 && i + 1 < argc) {
             input_ids_path = argv[++i];
+        } else if (strcmp(argv[i], "--vanilla-only") == 0) {
+            bflags.vanilla_only = true;
+        } else if (strcmp(argv[i], "--spec-only") == 0) {
+            bflags.spec_only = true;
+        } else if (strcmp(argv[i], "--reference") == 0 && i + 1 < argc) {
+            bflags.reference_path = argv[++i];
+        } else if (strcmp(argv[i], "--save-output") == 0 && i + 1 < argc) {
+            bflags.save_output_path = argv[++i];
+        } else if (strcmp(argv[i], "--json-results") == 0 && i + 1 < argc) {
+            bflags.json_results_path = argv[++i];
         } else {
             fargv.push_back(argv[i]);
         }
+    }
+
+    if (bflags.vanilla_only && bflags.spec_only) {
+        fprintf(stderr, "error: --vanilla-only and --spec-only are mutually exclusive\n");
+        return 1;
     }
 
     if (!common_params_parse((int) fargv.size(), fargv.data(), params, LLAMA_EXAMPLE_SPECULATIVE)) {
@@ -344,17 +523,55 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // n_ctx=0 loads the model's trained context (262144 for Gemma4/DSpark) and allocates
-    // a full KV cache for both target and draft, which OOMs on typical GPUs.
+    if (bflags.spec_only && params.speculative.draft.mparams.path.empty()) {
+        fprintf(stderr, "error: --spec-only requires -md DRAFT.gguf\n");
+        return 1;
+    }
+
+    if (bflags.spec_only && bflags.reference_path.empty()) {
+        fprintf(stderr, "error: --spec-only requires --reference PATH.json\n");
+        return 1;
+    }
+
+    // n_ctx=0 loads the model's trained context and allocates a full KV cache (OOM risk).
     if (params.n_ctx == 0) {
-        params.n_ctx = 512;
+        params.n_ctx = 8096;
         fprintf(stderr, "note: defaulting context to %d (pass -c to override)\n", params.n_ctx);
     }
 
-    const bool has_draft = !params.speculative.draft.mparams.path.empty();
+    const bool has_draft = !bflags.vanilla_only && !params.speculative.draft.mparams.path.empty();
     if (has_draft) {
-        params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
-        // keep params.speculative.draft.n_max from --spec-draft-n-max (default 4)
+        const bool only_none = params.speculative.types.size() == 1
+                && params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
+        if (params.speculative.types.empty() || only_none) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+        }
+    }
+    const bool use_dspark_spec = has_draft && params_use_dspark_spec(params);
+
+    // Vulkan flash-attn multi-token decode diverges from sequential at row 1+ (see smoke_batched_logits_repro).
+    if (use_dspark_spec && getenv("DSPARK_VERIFY_FA") == nullptr
+            && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        fprintf(stderr, "note: DSpark parallel verify requires --flash-attn off; disabling for target ctx\n");
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    // Scratch verify uses seq_id+1; vanilla reference must use the same n_parallel as spec.
+    if (getenv("DSPARK_BENCH_NPARALLEL")) {
+        const int bench_np = atoi(getenv("DSPARK_BENCH_NPARALLEL"));
+        if (bench_np > 0 && params.n_parallel < bench_np) {
+            fprintf(stderr, "note: benchmark ctx uses n_parallel=%d (DSPARK_BENCH_NPARALLEL)\n", bench_np);
+            params.n_parallel = bench_np;
+        }
+    } else if (use_dspark_spec && params.n_parallel < 2) {
+        fprintf(stderr, "note: DSpark scratch verify needs n_parallel >= 2; using 2\n");
+        params.n_parallel = 2;
+    }
+
+    if (use_dspark_spec
+            && getenv("DSPARK_KV_ZERO_ON_RM") == nullptr
+            && getenv("LLAMA_KV_ZERO_ON_RM") == nullptr) {
+        setenv("DSPARK_KV_ZERO_ON_RM", "1", 0);
     }
 
     llama_backend_init();
@@ -387,7 +604,7 @@ int main(int argc, char ** argv) {
         ctx_dft.reset(llama_init_from_model(model_dft.get(), common_context_params_to_llama(params_dft)));
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = ctx_dft.get();
-        if (!getenv("DSPARK_NO_SPLIT_VERIFY") && getenv("DSPARK_SPLIT_VERIFY")) {
+        if (!getenv("DSPARK_NO_SPLIT_VERIFY") && getenv("DSPARK_SPLIT_VERIFY") && use_dspark_spec) {
             llama_context_params cparams_feat = common_context_params_to_llama(params);
             cparams_feat.ctx_other = ctx_tgt;
             ctx_tgt_feat.reset(llama_init_from_model(
@@ -407,6 +624,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::vector<llama_token> reference;
+    if (!bflags.reference_path.empty()) {
+        if (!common_load_input_ids_json(bflags.reference_path, reference)) {
+            return 1;
+        }
+    }
+
     common_sampler_ptr smpl(common_sampler_init(llama_get_model(ctx_tgt), params.sampling));
 
     const int n_predict = params.n_predict > 0 ? params.n_predict : 32;
@@ -414,30 +638,56 @@ int main(int argc, char ** argv) {
 
     run_stats vanilla {};
     run_stats spec_stats {};
+    bool have_vanilla = false;
+    bool have_spec    = false;
 
-    // Fair order: vanilla first (baseline on cool GPU), then speculative.
-    // Spec-first inflates speedup via thermal throttling on the vanilla pass.
-    if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
-        return 1;
+    if (!bflags.spec_only) {
+        if (run_vanilla(params, ctx_tgt, smpl.get(), inp, n_predict, &vanilla) != 0) {
+            return 1;
+        }
+        have_vanilla = true;
+        if (!bflags.save_output_path.empty()) {
+            if (!io_save_tokens(bflags.save_output_path, vanilla.output)) {
+                fprintf(stderr, "warning: failed to save output to %s\n", bflags.save_output_path.c_str());
+            }
+        }
     }
 
     if (has_draft) {
         llama_synchronize(ctx_tgt);
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
-        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), 0, 0, -1);
-        const int cooldown_s = getenv("DSPARK_BENCH_NO_COOLDOWN") ? 0 : 3;
-        if (cooldown_s > 0) {
-            fprintf(stderr, "note: cooling down %ds before speculative run (DSPARK_BENCH_NO_COOLDOWN=1 to skip)\n",
-                    cooldown_s);
-            sleep((unsigned) cooldown_s);
+        common_speculative_dspark_context_reset(ctx_tgt);
+        if (ctx_dft) {
+            common_speculative_dspark_context_reset(ctx_dft.get());
+        }
+        if (ctx_tgt_feat) {
+            common_speculative_dspark_context_reset(ctx_tgt_feat.get());
+        }
+        if (!bflags.spec_only) {
+            const int cooldown_s = getenv("DSPARK_BENCH_NO_COOLDOWN") ? 0 : 3;
+            if (cooldown_s > 0) {
+                fprintf(stderr, "note: cooling down %ds before speculative run (DSPARK_BENCH_NO_COOLDOWN=1 to skip)\n",
+                        cooldown_s);
+                sleep((unsigned) cooldown_s);
+            }
         }
         common_sampler_reset(smpl.get());
-        if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+        if (use_dspark_spec) {
+            if (run_speculative(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
+                return 1;
+            }
+        } else if (run_speculative_standard(params, ctx_tgt, ctx_dft.get(), smpl.get(), spec, inp, n_predict, &spec_stats) != 0) {
             return 1;
+        }
+        have_spec = true;
+        if (!bflags.save_output_path.empty() && bflags.spec_only) {
+            if (!io_save_tokens(bflags.save_output_path, spec_stats.output)) {
+                fprintf(stderr, "warning: failed to save output to %s\n", bflags.save_output_path.c_str());
+            }
         }
     }
 
     fprintf(stderr, "\n=== Vanilla (target only) ===\n");
+    if (have_vanilla) {
     fprintf(stderr, "prompt: %d tokens, pp %.1f ms (%.2f tok/s)\n",
             vanilla.n_prompt, vanilla.pp_ms,
             vanilla.pp_ms > 0 ? 1000.0 * vanilla.n_prompt / vanilla.pp_ms : 0.0);
@@ -446,9 +696,13 @@ int main(int argc, char ** argv) {
             vanilla.n_generated > 0 ? 1000.0 * vanilla.n_generated / vanilla.gen_ms : 0.0);
     print_tokens("output", vanilla.output, n_inp);
     print_text(ctx_tgt, "output", vanilla.output, n_inp);
+    } else {
+        fprintf(stderr, "(skipped)\n");
+    }
 
-    if (has_draft) {
-        fprintf(stderr, "\n=== Speculative (draft-dspark) ===\n");
+    if (have_spec) {
+        fprintf(stderr, "\n=== Speculative (%s) ===\n",
+                use_dspark_spec ? "draft-dspark" : common_speculative_type_to_str(params.speculative.types[0]).c_str());
         fprintf(stderr, "prompt: %d tokens, pp+setup %.1f ms (%.2f tok/s)\n",
                 spec_stats.n_prompt, spec_stats.pp_ms,
                 spec_stats.pp_ms > 0 ? 1000.0 * spec_stats.n_prompt / spec_stats.pp_ms : 0.0);
@@ -464,7 +718,8 @@ int main(int argc, char ** argv) {
         if (spec_stats.n_propose_steps > 0) {
             fprintf(stderr, "mean accepted/step: %.2f\n",
                     (double) spec_stats.n_accepted / (double) spec_stats.n_propose_steps);
-            const double v_fwd = vanilla.n_generated > 0 ? vanilla.gen_ms / vanilla.n_generated : 0.0;
+            const double v_fwd = have_vanilla && vanilla.n_generated > 0
+                    ? vanilla.gen_ms / vanilla.n_generated : 0.0;
             const double d_step = spec_stats.draft_ms  / spec_stats.n_propose_steps;
             const double vf_step = spec_stats.verify_ms / spec_stats.n_propose_steps;
             const double tok_step = (double) spec_stats.n_generated / spec_stats.n_propose_steps;
@@ -492,41 +747,72 @@ int main(int argc, char ** argv) {
         print_text(ctx_tgt, "output", spec_stats.output, n_inp);
 
         fprintf(stderr, "\n=== Comparison ===\n");
-        // the two loops may stop at slightly different lengths, so compare the common prefix
-        const size_t n_cmp = std::min(vanilla.output.size(), spec_stats.output.size());
+        const std::vector<llama_token> & ref_out = !reference.empty()
+                ? reference
+                : (have_vanilla ? vanilla.output : spec_stats.output);
+        const size_t n_cmp = std::min(ref_out.size(), spec_stats.output.size());
         size_t first_mismatch = n_cmp;
         for (size_t i = n_inp; i < n_cmp; ++i) {
-            if (vanilla.output[i] != spec_stats.output[i]) {
+            if (ref_out[i] != spec_stats.output[i]) {
                 first_mismatch = i;
                 break;
             }
         }
         const bool prefix_match = first_mismatch == n_cmp;
+        const char * ref_label = !reference.empty() ? "reference" : "vanilla";
         fprintf(stderr, "token match on common prefix (temp=%.2f): %s\n",
                 params.sampling.temp, prefix_match ? "YES" : "NO");
         if (!prefix_match) {
-            fprintf(stderr, "first mismatch at gen index %zu: vanilla=%d spec=%d\n",
-                    first_mismatch - n_inp,
-                    (int) vanilla.output[first_mismatch], (int) spec_stats.output[first_mismatch]);
+            fprintf(stderr, "first mismatch at gen index %zu: %s=%d spec=%d\n",
+                    first_mismatch - n_inp, ref_label,
+                    (int) ref_out[first_mismatch], (int) spec_stats.output[first_mismatch]);
         }
         // tokens/s already accounts for token count, so this is a fair throughput ratio
-        const double pp_v  = vanilla.pp_ms > 0 ? 1000.0 * vanilla.n_prompt / vanilla.pp_ms : 0.0;
+        const double pp_v  = have_vanilla && vanilla.pp_ms > 0
+                ? 1000.0 * vanilla.n_prompt / vanilla.pp_ms : 0.0;
         const double pp_s  = spec_stats.pp_ms > 0 ? 1000.0 * spec_stats.n_prompt / spec_stats.pp_ms : 0.0;
-        const double tgp_v = vanilla.gen_ms > 0 ? 1000.0 * vanilla.n_generated / vanilla.gen_ms : 0.0;
+        const double tgp_v = have_vanilla && vanilla.gen_ms > 0
+                ? 1000.0 * vanilla.n_generated / vanilla.gen_ms : 0.0;
         const double tgp_s = spec_stats.gen_ms > 0 ? 1000.0 * spec_stats.n_generated / spec_stats.gen_ms : 0.0;
-        fprintf(stderr, "--- throughput ---\n");
-        fprintf(stderr, "  pp  (prefill):  vanilla %6.2f tok/s  |  spec %6.2f tok/s", pp_v, pp_s);
-        if (pp_v > 0 && pp_s > 0) {
-            fprintf(stderr, "  (%.2fx)", pp_s / pp_v);
+        if (have_vanilla) {
+            fprintf(stderr, "--- throughput ---\n");
+            fprintf(stderr, "  pp  (prefill):  vanilla %6.2f tok/s  |  spec %6.2f tok/s", pp_v, pp_s);
+            if (pp_v > 0 && pp_s > 0) {
+                fprintf(stderr, "  (%.2fx)", pp_s / pp_v);
+            }
+            fputc('\n', stderr);
+            fprintf(stderr, "  tgp (generate): vanilla %6.2f tok/s  |  spec %6.2f tok/s", tgp_v, tgp_s);
+            if (tgp_v > 0 && tgp_s > 0) {
+                fprintf(stderr, "  (%.2fx)", tgp_s / tgp_v);
+            }
+            fputc('\n', stderr);
+            if (tgp_v > 0 && tgp_s > 0) {
+                fprintf(stderr, "tgp speedup: %.2fx\n", tgp_s / tgp_v);
+            }
+        } else {
+            fprintf(stderr, "spec tgp: %.2f tok/s\n", tgp_s);
         }
-        fputc('\n', stderr);
-        fprintf(stderr, "  tgp (generate): vanilla %6.2f tok/s  |  spec %6.2f tok/s", tgp_v, tgp_s);
-        if (tgp_v > 0 && tgp_s > 0) {
-            fprintf(stderr, "  (%.2fx)", tgp_s / tgp_v);
+
+        if (!bflags.json_results_path.empty()) {
+            FILE * jf = fopen(bflags.json_results_path.c_str(), "w");
+            if (jf) {
+                write_json_results(
+                        jf, params, n_inp,
+                        have_vanilla ? &vanilla : nullptr,
+                        &spec_stats,
+                        reference.empty() ? nullptr : &reference,
+                        prefix_match,
+                        prefix_match ? -1 : (ssize_t) (first_mismatch - n_inp));
+                fclose(jf);
+            } else {
+                fprintf(stderr, "warning: failed to write json results to %s\n", bflags.json_results_path.c_str());
+            }
         }
-        fputc('\n', stderr);
-        if (tgp_v > 0 && tgp_s > 0) {
-            fprintf(stderr, "tgp speedup: %.2fx\n", tgp_s / tgp_v);
+    } else if (have_vanilla && !bflags.json_results_path.empty()) {
+        FILE * jf = fopen(bflags.json_results_path.c_str(), "w");
+        if (jf) {
+            write_json_results(jf, params, n_inp, &vanilla, nullptr, nullptr, true, -1);
+            fclose(jf);
         }
     }
 

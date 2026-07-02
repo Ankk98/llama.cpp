@@ -259,6 +259,7 @@ struct llama_hparams {
     uint32_t markov_rank = 0;
     bool enable_confidence_head = false;
     bool confidence_head_with_markov = false;
+    bool dspark_attention_k_eq_v = true; // Gemma4; Qwen3 sets false
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141

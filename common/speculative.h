@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dspark_pipeline.h"
 #include "llama.h"
 #include "common.h"
 
@@ -74,6 +75,9 @@ void common_speculative_sync_params(common_speculative * spec, const common_para
 // DSpark: toggle expensive target layer-input extraction (5 hidden tensors per token)
 void common_speculative_dspark_target_features_enable(common_speculative * spec, bool enable);
 
+// No-op (legacy). Batched verify uses a scratch sequence; call is harmless at loop start.
+void common_speculative_dspark_verify_kv_canon_reset();
+
 struct common_speculative_dspark_prefill_timing {
     double fast_ms  = 0; // target decode with layer taps off (optional first pass)
     double setup_ms = 0; // target decode with layer taps on + process()
@@ -98,8 +102,8 @@ struct common_speculative_dspark_verify_timing {
     double process_ms         = 0;
 };
 
-// DSpark: after logits-only verify + accept, re-decode committed prefix with features on and
-// run process() for the draft encoder / KV injection increment
+// DSpark: after verify accept, decode committed tokens with layer taps on and run process().
+// When kv_append_only is true, canonical KV ends at pos_verify - 1 (scratch verify path).
 bool common_speculative_dspark_process_committed(
         common_speculative * spec,
         struct llama_context * ctx_tgt,
@@ -107,9 +111,14 @@ bool common_speculative_dspark_process_committed(
         llama_pos pos_verify,
         llama_token anchor,
         const llama_tokens & committed_ids,
-        struct llama_batch & batch);
+        struct llama_batch & batch,
+        bool kv_append_only = false);
 
-// DSpark: batched verify (logits-only forward, then committed feature re-decode + process)
+// DSpark: clear target/draft KV and reset decode flags between benchmark runs.
+void common_speculative_dspark_context_reset(struct llama_context * ctx);
+
+// DSpark: target verify - scratch logits, accept, commit on canonical (see dspark-refactor-pipeline.md).
+// Sequential fallback via DSPARK_VERIFY_SEQ=1 only.
 bool common_speculative_dspark_verify_batched(
         common_speculative * spec,
         struct common_sampler * smpl,
