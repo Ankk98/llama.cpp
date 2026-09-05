@@ -1904,13 +1904,15 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
-    uint32_t state_out_off;   // sentinel: 0=non-fused, N+1=fused with cache offset N
+    uint32_t state_out_off;     // sentinel: 0=non-fused, N+1=fused with cache offset N
+    uint32_t state_slot_stride; // stride between snapshot slots in cache (floats)
 };
 
 struct vk_gdn_fused_cache {
-    float *  data;
-    int64_t  slot_stride;
-    uint32_t s_off_cache;
+    const ggml_tensor * cache_view = nullptr;
+    float *  data = nullptr;
+    int64_t  slot_stride = 0;
+    uint32_t s_off_cache = 0;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -12927,20 +12929,26 @@ static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx
     const int64_t n_written = std::min<int64_t>(n_tokens, K);
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
     const ggml_tensor * cpy = nullptr; int skip = 0;
-    for (int j = node_idx + 1; j < cgraph->n_nodes && !cpy; ++j) {
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (ggml_is_empty(n) || ggml_op_is_empty(n->op) || !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
-        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) return 0;
+        if (n->op == GGML_OP_GATED_DELTA_NET) return 0;
+        if (n->op != GGML_OP_CPY) continue;
+        if (n->flags & GGML_TENSOR_FLAG_OUTPUT) return 0;
+        const ggml_tensor * src = n->src[0], * dst = n->src[1];
+        if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) continue;
+        const std::array<int64_t, GGML_MAX_DIMS> ne = { D, n_seqs, n_written, 1 };
+        if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || !dst->data || !dst->buffer ||
+            !std::equal(ne.begin(), ne.end(), dst->ne) ||
+            dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+            dst->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) continue;
+        if (src->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) continue;
         cpy = n; skip = j - node_idx;
+        break;
     }
     if (!cpy) return 0;
-    const ggml_tensor * src = cpy->src[0], * dst = cpy->src[1];
-    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) return 0;
-    const std::array<int64_t, GGML_MAX_DIMS> ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || !dst->data || !dst->buffer ||
-        !std::equal(ne.begin(), ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32)) return 0;
-    if (src->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) return 0;
+    const ggml_tensor * dst = cpy->src[1];
+    fc.cache_view = dst;
     fc.data = (float *)dst->data;
     fc.slot_stride = K > 1 ? (int64_t)(dst->nb[2] / sizeof(float)) : 0;
     const uint32_t byte_off = (uint32_t)((char *)dst->data - (char *)ggml_backend_buffer_get_base(dst->buffer));
@@ -12991,9 +12999,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     const float scale = 1.0f / sqrtf((float)S_v);
     uint32_t state_out_off = 0;
+    uint32_t state_slot_stride = 0;
     vk_subbuffer cache_buf = dst_buf; // dummy binding 7 on the non-fused path
-    if (fused_cache != nullptr) {
+    if (fused_cache != nullptr && fused_cache->cache_view != nullptr) {
         state_out_off = fused_cache->s_off_cache;
+        state_slot_stride = (uint32_t)fused_cache->slot_stride;
+        cache_buf = ggml_vk_tensor_subbuffer(ctx, (ggml_tensor *)fused_cache->cache_view);
     }
 
     const vk_op_gated_delta_net_push_constants pc = {
@@ -13004,7 +13015,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         neq1, rq3,
         scale,
         K,
-        state_out_off
+        state_out_off,
+        state_slot_stride
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,

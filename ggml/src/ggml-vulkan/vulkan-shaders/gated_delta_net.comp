@@ -32,7 +32,8 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
-    uint state_out_off; // sentinel: 0=non-fused, N+1=fused (cache elem offset N)
+    uint state_out_off;     // sentinel: 0=non-fused, N+1=fused (cache elem offset N)
+    uint state_slot_stride; // stride between snapshot slots in cache (floats), 0 for K==1
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -108,7 +109,7 @@ void main() {
     const uint state_in_base       = (seq_id * H + head_id) * state_size;
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
-    const uint state_size_per_snap = state_size * H * n_seqs;
+    const uint state_size_per_snap = state_slot_stride != 0u ? state_slot_stride : state_size * H * n_seqs;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
