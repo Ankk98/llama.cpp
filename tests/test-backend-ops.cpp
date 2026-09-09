@@ -10671,6 +10671,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Short verification batches over long KV caches.
+    for (int nr : {6, 8}) {
+        for (int kv : {16384, 32768}) {
+            for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {nr, 1}, kv, 9, true, true, 0, 10, GGML_PREC_F32, type, type));
+            }
+        }
+    }
+
+    // Odd head ratios and the token-only tile boundary.
+    for (int nr : {3, 8}) {
+        for (int nb : {31, 32, 33}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {nr, 1}, 259, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
