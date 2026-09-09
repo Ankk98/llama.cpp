@@ -67,7 +67,7 @@ layout (push_constant) uniform parameter {
     float m0;
     float m1;
 
-    uint32_t gqa_ratio;
+    uint32_t gqa_ratio; // heads per tile
     uint32_t split_kv;
     uint32_t k_num;
 } p;
@@ -115,7 +115,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
-        uint32_t offset = iq2 + r;
+        uint32_t offset = p.N == 1 ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * 2 * p.k_num;
         data_o[o_offset + offset] = D_TYPE(elem);
     }
     return elem;
@@ -142,7 +142,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
     return ACC_TYPE(data_s[h]);
 }
 
-uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+uint32_t i, N, KV, split_k_index, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride;
 
@@ -151,28 +151,15 @@ void init_indices()
     N = p.N;
     KV = p.KV;
 
-    if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
-            i = 0;
-            // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
-        } else {
-            gqa_iq1 = 0;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
-            i = gl_WorkGroupID.x / p.k_num;
-        }
-    } else if (p.gqa_ratio > 1) {
+    split_k_index = gl_WorkGroupID.x % p.k_num;
+    i = gl_WorkGroupID.x / p.k_num;
+    gqa_iq1 = 0;
+    if (p.gqa_ratio > 1) {
+        const uint32_t ncols1 = max(1u, Br / p.gqa_ratio);
+        gqa_iq1 = i * ncols1;
+        N = min(ncols1, p.N - gqa_iq1) * p.gqa_ratio;
         i = 0;
-        gqa_iq1 = gl_WorkGroupID.x;
-        split_k_index = 0;
-    } else {
-        i = gl_WorkGroupID.x;
-        gqa_iq1 = 0;
-        split_k_index = 0;
     }
-
-    Tr = CEIL_DIV(N, Br);
 
     start_j = split_k_index * p.split_kv / Bc;
     end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
@@ -197,17 +184,28 @@ void init_indices()
     iv3 = iq3 / rv3;
     iv2 = iq2 / rv2;
 
-    // nb?1 are already divided by the type size and are in units of elements.
-    // When using grouped query attention, Q is indexed by iq2, so the stride
-    // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    // nb?1 are in elements; nb?2 and nb?3 are in bytes.
+    q_stride = p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
-    // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    m_stride = KV;
+}
+
+uint32_t fa_token_row(uint32_t r) {
+    if (p.N == 1) {
+        return 0;
+    }
+    return p.gqa_ratio > 1 ? r / p.gqa_ratio : i * Br + r;
+}
+
+uint32_t fa_q_row_offset(uint32_t r) {
+    if (p.gqa_ratio == 1) {
+        return (i * Br + r) * p.nb01;
+    }
+    if (p.N == 1) {
+        return r * (p.nb02 / 4);
+    }
+    return (r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * (p.nb02 / 4);
 }
 
 // Bias applied to softmax to stay in fp16 range.
@@ -215,9 +213,10 @@ void init_indices()
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 // Store the output when doing grouped query attention.
-// Rows index by Q's dimension 2, and the first N rows are valid.
+// Rows index tokens and heads within the tile.
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
-    uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    uint32_t row = p.N == 1 ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * p.k_num;
+    uint32_t offset = row * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }

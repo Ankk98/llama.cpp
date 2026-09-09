@@ -114,14 +114,14 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         const bool is_in_bounds = r < Br && d < HSK / 4 && i * Br + r < N;
 #ifndef MMQ
-        if (is_in_bounds) {
-            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+        if (r < Br) {
+            Qf[r * qf_stride + d] = is_in_bounds ? FLOAT_TYPEV4(data_qv4[q_offset / 4 + fa_q_row_offset(r) / 4 + d] * p.scale) : FLOAT_TYPEV4(0);
         }
 #else
         const uint buf_ib = r * qf_stride + d / 8;
         const uint buf_iqs = d % 8;
 
-        vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale : vec4(0.0f);
+        vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + fa_q_row_offset(r) / 4 + d] * p.scale : vec4(0.0f);
         const vec4 abs_vals = abs(vals);
 
         const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
@@ -210,7 +210,7 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
+                bool nem1_bounds_check = p.gqa_ratio > 1 ? p.N > 1 : (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 barrier();
@@ -218,8 +218,8 @@ void main() {
                     uint32_t c = (idx + tid) % Bc;
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
-                        if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
+                        if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || gqa_iq1 + fa_token_row(r) < p.nem1)) {
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + fa_token_row(r) * m_stride + (j * Bc + c)]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {

@@ -10658,6 +10658,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    // GQA rectangles: token tails, head tiles, strided Q, and split-K with sinks.
+    for (int nr : {6, 8}) {
+        for (int nb : {1, 3, 9, 33}) {
+            for (int kv : {259, 2048}) {
+                for (bool permuted : {false, true}) {
+                    const ggml_type type = kv == 259 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+                    const std::array<int32_t, 4> permute = permuted ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3};
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr, 2}, kv, nb, true, true, 0, 10, GGML_PREC_F32, type, type, permute));
+                }
+            }
+        }
+    }
+
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));

@@ -1459,7 +1459,7 @@ struct vk_flash_attn_push_constants {
     float m0;
     float m1;
 
-    uint32_t gqa_ratio;
+    uint32_t gqa_ratio; // heads per tile
     uint32_t split_kv;
     uint32_t k_num;
 };
@@ -11196,6 +11196,23 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+static uint32_t ggml_vk_flash_attn_head_tile(uint32_t n_tokens, uint32_t gqa_ratio, uint32_t max_rows) {
+    // Token-only tiles already reuse KV across a full row block.
+    if (n_tokens >= max_rows) {
+        return 1;
+    }
+
+    if (n_tokens == 1 && gqa_ratio <= max_rows) {
+        return gqa_ratio;
+    }
+
+    uint32_t ncols2 = 1;
+    while (ncols2 * 2 <= std::min(max_rows, 8u) && gqa_ratio % (ncols2 * 2) == 0) {
+        ncols2 *= 2;
+    }
+    return ncols2;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -11283,17 +11300,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
-        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
-        // grouped query attention - make the N dimension equal to gqa_ratio, reduce
-        // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
-        // and change addressing calculations to index Q's dimension 2.
-        gqa_ratio = qk_ratio;
-        N = gqa_ratio;
+    if (qk_ratio > 1 && qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+        gqa_ratio = ggml_vk_flash_attn_head_tile(N, qk_ratio, max_gqa);
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
+    GGML_ASSERT(gqa_ratio <= tuning_params.block_rows);
+    const uint32_t ncols1 = std::max(1u, tuning_params.block_rows / gqa_ratio);
+    workgroups_x = CEIL_DIV(N, ncols1);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -11341,7 +11356,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = gqa_ratio == 1 && mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff);
@@ -11376,16 +11391,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Bc = fa_pipeline_state.Bc;
 
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
-    const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
-    } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
-        }
+    // Keep multi-token KV partitions independent of head packing.
+    const uint32_t total_wgs_no_split = N > 1 ? CEIL_DIV(N, Br) * (uint32_t) neq2 * workgroups_z : workgroups_x * workgroups_y * workgroups_z;
+    if (total_wgs_no_split < shader_core_count * 2) {
+        split_k = shader_core_count * 2 / total_wgs_no_split;
     }
 
     if (split_k > 1) {
@@ -11518,15 +11529,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        // We reuse workgroups_x to mean the number of splits, so we need to
-        // cancel out the divide by wg_denoms[0].
-        uint32_t dispatch_x;
-        if (gqa_ratio > 1) {
-            workgroups_x *= pipeline->wg_denoms[0];
-            dispatch_x = split_k * workgroups_x;
-        } else {
-            dispatch_x = Tr * split_k * pipeline->wg_denoms[0];
-        }
+        const uint32_t dispatch_x = split_k * workgroups_x * Br;
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -11540,13 +11543,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
         ctx->prealloc_split_k_need_sync = true;
     } else {
-        if (gqa_ratio > 1) {
-            // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
-            workgroups_x *= pipeline->wg_denoms[0];
-        }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+                                    pc, { workgroups_x * Br, workgroups_y, workgroups_z });
     }
 
     if (use_dequant_kv) {
