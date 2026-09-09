@@ -168,7 +168,7 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = p.gqa_ratio > 1 ? p.N > 1 : (p.nem1 % Br) != 0;
+                bool nem1_bounds_check = p.gqa_ratio > 1 ? !SINGLE_TOKEN : (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {

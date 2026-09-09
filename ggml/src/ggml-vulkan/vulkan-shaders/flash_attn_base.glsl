@@ -24,6 +24,7 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+#define SINGLE_TOKEN ((Flags & 16) != 0 || p.N == 1)
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -115,7 +116,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
-        uint32_t offset = p.N == 1 ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * 2 * p.k_num;
+        uint32_t offset = SINGLE_TOKEN ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * 2 * p.k_num;
         data_o[o_offset + offset] = D_TYPE(elem);
     }
     return elem;
@@ -155,7 +156,7 @@ void init_indices()
     i = gl_WorkGroupID.x / p.k_num;
     gqa_iq1 = 0;
     if (p.gqa_ratio > 1) {
-        const uint32_t ncols1 = max(1u, Br / p.gqa_ratio);
+        const uint32_t ncols1 = (Flags & 16) != 0 ? 1 : max(1u, Br / p.gqa_ratio);
         gqa_iq1 = i * ncols1;
         N = min(ncols1, p.N - gqa_iq1) * p.gqa_ratio;
         i = 0;
@@ -192,7 +193,7 @@ void init_indices()
 }
 
 uint32_t fa_token_row(uint32_t r) {
-    if (p.N == 1) {
+    if (SINGLE_TOKEN) {
         return 0;
     }
     return p.gqa_ratio > 1 ? r / p.gqa_ratio : i * Br + r;
@@ -202,7 +203,7 @@ uint32_t fa_q_row_offset(uint32_t r) {
     if (p.gqa_ratio == 1) {
         return (i * Br + r) * p.nb01;
     }
-    if (p.N == 1) {
+    if (SINGLE_TOKEN) {
         return r * (p.nb02 / 4);
     }
     return (r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * (p.nb02 / 4);
@@ -216,7 +217,7 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 // Rows index tokens and heads within the tile.
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
-    uint32_t row = p.N == 1 ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * p.k_num;
+    uint32_t row = SINGLE_TOKEN ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * p.k_num;
     uint32_t offset = row * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }

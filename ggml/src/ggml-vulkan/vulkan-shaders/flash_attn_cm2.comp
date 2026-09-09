@@ -141,7 +141,7 @@ ACC_TYPE Max(const in uint32_t row, const in uint32_t col, const in ACC_TYPE ele
 D_TYPE perElemOpGqaStore(const in uint32_t r, const in uint32_t c, const in D_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c < HSV) {
-        uint32_t row = p.N == 1 ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * p.k_num;
+        uint32_t row = SINGLE_TOKEN ? iq2 + r : iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * p.k_num;
         uint32_t offset = row * HSV + c;
         data_o[o_offset + offset] = D_TYPE(elem);
     }
