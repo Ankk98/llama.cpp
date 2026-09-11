@@ -11207,11 +11207,12 @@ static uint32_t ggml_vk_flash_attn_head_tile(uint32_t n_tokens, uint32_t gqa_rat
         return gqa_ratio;
     }
 
-    uint32_t ncols2 = 1;
-    while (ncols2 * 2 <= std::min(max_rows, 8u) && gqa_ratio % (ncols2 * 2) == 0) {
-        ncols2 *= 2;
+    for (uint32_t ncols2 = std::min(max_rows, 8u); ncols2 > 1; --ncols2) {
+        if (gqa_ratio % ncols2 == 0) {
+            return ncols2;
+        }
     }
-    return ncols2;
+    return 1;
 }
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
@@ -11394,8 +11395,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    // Keep multi-token KV partitions independent of head packing.
-    const uint32_t total_wgs_no_split = N > 1 ? CEIL_DIV(N, Br) * (uint32_t) neq2 * workgroups_z : workgroups_x * workgroups_y * workgroups_z;
+    const uint32_t total_wgs_no_split = workgroups_x * workgroups_y * workgroups_z;
     if (total_wgs_no_split < shader_core_count * 2) {
         split_k = shader_core_count * 2 / total_wgs_no_split;
     }

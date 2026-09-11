@@ -10660,7 +10660,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // GQA rectangles: token tails, head tiles, strided Q, and split-K with sinks.
     for (int nr : {6, 8}) {
-        for (int nb : {1, 3, 9, 33}) {
+        for (int nb : {1, 2, 3, 9, 33}) {
             for (int kv : {259, 2048}) {
                 for (bool permuted : {false, true}) {
                     const ggml_type type = kv == 259 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
