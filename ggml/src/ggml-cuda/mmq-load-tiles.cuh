@@ -271,6 +271,29 @@ __forceinline__ void ggml_cuda_mmq_decode_ptq1_0_qs4(uint32_t packed, int * __re
         dst[t * stride]     = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
     }
 }
+#else
+// HIP port of the above: widened base-3 digits like vec_dot_ptq1_0_q8_1, but
+// the tile holds signed bytes, so the -1 happens per 16-bit lane, where the
+// junk bytes are set nonzero first to keep borrows local. NB: amdgcn_perm
+// picks sel bit2=0 from the second arg, opposite of __byte_perm.
+static __device__
+__forceinline__ void ggml_cuda_mmq_decode_ptq1_0_qs4(uint32_t packed, int * __restrict__ dst, int stride) {
+    uint32_t v_lo = __builtin_amdgcn_perm(0, packed, 0x0C010C00);
+    uint32_t v_hi = __builtin_amdgcn_perm(0, packed, 0x0C030C02);
+
+#    pragma unroll
+    for (int t = 0; t < 5; ++t) {
+        const uint32_t w_lo = v_lo * 3u;
+        const uint32_t w_hi = v_hi * 3u;
+        v_lo = w_lo & 0x00FF00FFu;
+        v_hi = w_hi & 0x00FF00FFu;
+        const uint32_t d_lo = (((w_lo >> 8) | 0x01000100u) - 0x00010001u) & 0x00FF00FFu;
+        const uint32_t d_hi = (((w_hi >> 8) | 0x01000100u) - 0x00010001u) & 0x00FF00FFu;
+        dst[t * stride] = (int) ((d_lo & 0xFFu) | ((d_lo >> 8) & 0xFF00u) |
+                                 ((d_hi & 0xFFu) << 16) | ((d_hi & 0xFF0000u) << 8));
+    }
+}
+#endif
 
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const char * __restrict__ x,
@@ -283,7 +306,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
 
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int *   x_qs = (int *) x_tile;
     float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
 #    else
@@ -309,7 +332,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         }
 
         const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + kbx;
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         int * row = x_qs + i * sram_stride + kbx * (QK_PTQ1_0 / 4);
 #    else
         int * row = x_qs + i * (2 * MMQ_TILE_NE_K + 1) + kbx * (QK_PTQ1_0 / 4);
@@ -328,7 +351,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
                 v                 = w0 & 0x00FF00FF;
                 const uint32_t w1 = v * 3;
                 v                 = w1 & 0x00FF00FF;
+#if !defined(GGML_USE_HIP)
                 row[30 + t / 2]   = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+#else
+                // same lane-local signed digits as the decode helper above
+                const uint32_t d0 = ((((w0 >> 8) | 0x01000100u) - 0x00010001u) & 0x00FF00FFu);
+                const uint32_t d1 = ((((w1 >> 8) | 0x01000100u) - 0x00010001u) & 0x00FF00FFu);
+                row[30 + t / 2]   = (int) ((d0 & 0xFFu) | ((d0 >> 8) & 0xFF00u) |
+                                           ((d1 & 0xFFu) << 16) | ((d1 & 0xFF0000u) << 8));
+#endif
             }
         }
     }
@@ -347,14 +378,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         }
 
         const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + scale_block;
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i * sram_stride + ksx] = bxi->d;
 #    else
         x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + ksx] = bxi->d;
 #    endif
     }
 }
-#endif
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
