@@ -901,12 +901,9 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
     int                  sumi[4] = { 0, 0, 0, 0 };
     int                  sumu[4] = { 0, 0, 0, 0 };
 
-    // Four packed bytes advance in the low bytes of 16-bit lanes, so one
-    // 32-bit multiply steps four trit streams at once (3*255 < 2^16, no
-    // cross-lane carry). Digits come out as {0,1,2}; the -1 folds into the
-    // activation sums, which a per-byte subtract cannot do borrow-free.
-    // NB: __builtin_amdgcn_perm picks sel bit2=0 from the SECOND arg, the
-    // opposite of CUDA __byte_perm, so the operands are swapped vs _multi.
+    // Four packed bytes advance in the low bytes of 16-bit lanes, so one 32-bit multiply steps four trit streams at once (3*255 < 2^16, no cross-lane carry).
+    // Digits come out as {0,1,2}; the -1 folds into the activation sums, which a per-byte subtract cannot do borrow-free.
+    // __builtin_amdgcn_perm picks sel bit2=0 from the SECOND arg, opposite of CUDA __byte_perm, so the operands are swapped vs _multi.
     const uint32_t * qs32 = (const uint32_t *) bq->qs;
 
 #    pragma unroll
