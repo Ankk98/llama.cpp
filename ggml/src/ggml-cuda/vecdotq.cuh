@@ -897,6 +897,7 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
                                                             const int & kbx,
                                                             const int & iqs) {
 #if defined(GGML_USE_HIP)
+    // Host mirror of this branch lives in tests/test-ptq1_0-cuda-dot.cpp; update both together.
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[4] = { 0, 0, 0, 0 };
     int                  sumu[4] = { 0, 0, 0, 0 };
