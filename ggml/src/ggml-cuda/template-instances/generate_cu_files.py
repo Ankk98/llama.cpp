@@ -115,7 +115,7 @@ for ncols in [8, 16, 32, 64]:
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
-        source = SOURCE_MMQ_CUDA_ONLY if type == "GGML_TYPE_PTQ1_0" else SOURCE_MMQ
+        source = SOURCE_MMQ
         f.write(source.format(type=type))
 
 for type in range(1, 17):
