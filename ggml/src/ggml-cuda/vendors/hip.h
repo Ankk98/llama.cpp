@@ -209,13 +209,14 @@
 #define CDNA // For the entire family
 #endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 
-#if defined(__GFX12__)
+#if defined(__gfx1200__) || defined(__gfx1201__)
 #define RDNA4
-#endif // defined(__GFX12__)
+#endif // defined(__gfx1200__) || defined(__gfx1201__)
 
-#if defined(__GFX11__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 #define RDNA3
-#endif // defined(__GFX11__)
+#endif // defined(__gfx1100__) etc.
 
 #if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
 #define RDNA3_5
@@ -230,13 +231,13 @@
 #define RDNA2
 #endif
 
-#if defined(__gfx1010__) || defined(__gfx1012__)
+#if defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
 #define RDNA1
-#endif // defined(__gfx1010__) || defined(__gfx1012__)
+#endif // defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
 
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#if defined(RDNA4) || defined(RDNA3) || defined(RDNA3_5) || defined(RDNA2) || defined(RDNA1)
 #define RDNA // For the entire family
-#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA3_5) || defined(RDNA2) || defined(RDNA1)
 
 #ifndef __has_builtin
     #define __has_builtin(x) 0

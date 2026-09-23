@@ -95,35 +95,6 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
 #define GGML_CUDA_CC_IS_CDNA4(cc)   (cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
-// HIP device passes define __gfx* per offload arch, host passes do not.
-// Map them to the RDNA/CDNA macros used by device code. Host code uses
-// runtime cc and is unaffected. Each define keeps its manual -D override.
-#if defined(GGML_USE_HIP) && !defined(RDNA) && !defined(CDNA) && !defined(GCN)
-#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
-#define RDNA
-#define RDNA3
-#define RDNA3_5
-#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-#define RDNA
-#define RDNA3
-#define RDNA3_0
-#elif defined(__gfx1200__) || defined(__gfx1201__)
-#define RDNA
-#define RDNA4
-#elif defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
-      defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
-#define RDNA
-#define RDNA2
-#elif defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__)
-#define RDNA
-#define RDNA1
-#elif defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__)
-#define CDNA
-#elif defined(__gfx900__) || defined(__gfx906__)
-#define GCN
-#endif
-#endif // HIP gfx to RDNA/CDNA macros
-
 // Moore Threads
 #define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
 
